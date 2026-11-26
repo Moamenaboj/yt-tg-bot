@@ -6,7 +6,9 @@ Designed to run inside GitHub Actions triggered by a Cloudflare Worker.
 
 import asyncio
 import base64
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -15,16 +17,23 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 from PIL import Image
-from telethon import TelegramClient
+from telethon import TelegramClient, helpers
 from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.network import MTProtoSender
 from telethon.sessions import MemorySession
+from telethon.tl.alltlobjects import LAYER
+from telethon.tl.functions import InitConnectionRequest, InvokeWithLayerRequest
+from telethon.tl.functions.help import GetConfigRequest
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 from telethon.tl.types import (
     DocumentAttributeAudio,
     DocumentAttributeFilename,
     DocumentAttributeVideo,
+    InputFile,
+    InputFileBig,
 )
 import yt_dlp
 
@@ -189,6 +198,7 @@ def build_base_ydl_opts(cookies_path: Optional[Path]) -> dict[str, Any]:
         "retries": 5,
         "fragment_retries": 5,
         "file_access_retries": 3,
+        "concurrent_fragment_downloads": 8,
         "socket_timeout": 30,
         "source_address": "0.0.0.0",
         "js_runtimes": {"deno": {}},
@@ -494,8 +504,203 @@ async def download_with_size_fallback(
     )
 
 
+class FastUploader:
+    """
+    Parallel MTProto file uploader using multiple concurrent MTProtoSender
+    connections to the bot's DC with 512 KB parts (typically 5x-15x faster than
+    Telethon's single-connection sequential upload_file).
+    """
+
+    def __init__(self, client: TelegramClient, connections: int = 8):
+        self.client = client
+        self.connections = connections
+        self.senders: list[MTProtoSender] = []
+
+    async def start(self) -> None:
+        if self.senders:
+            return
+        dc = await self.client._get_dc(self.client.session.dc_id)
+
+        async def make_sender() -> MTProtoSender:
+            sender = MTProtoSender(self.client.session.auth_key, loggers=self.client._log)
+            await sender.connect(
+                self.client._connection(
+                    dc.ip_address,
+                    dc.port,
+                    dc.id,
+                    loggers=self.client._log,
+                    proxy=self.client._proxy,
+                    local_addr=self.client._local_addr,
+                )
+            )
+            init_req = InitConnectionRequest(
+                api_id=self.client.api_id,
+                device_model="yt-tg-bot",
+                system_version="Linux",
+                app_version="1.0",
+                system_lang_code="en",
+                lang_pack="",
+                lang_code="en",
+                query=GetConfigRequest(),
+            )
+            await sender.send(InvokeWithLayerRequest(LAYER, init_req))
+            return sender
+
+        results = await asyncio.gather(
+            *(make_sender() for _ in range(self.connections)),
+            return_exceptions=True,
+        )
+        for item in results:
+            if isinstance(item, MTProtoSender):
+                self.senders.append(item)
+            else:
+                print(f"[warn] parallel sender init failed: {item}", file=sys.stderr)
+
+    async def close(self) -> None:
+        if not self.senders:
+            return
+        await asyncio.gather(*(s.disconnect() for s in self.senders), return_exceptions=True)
+        self.senders.clear()
+
+    async def upload(
+        self,
+        file_path: Path,
+        file_name: str,
+        progress_callback: Optional[Callable[[int, int], Any]] = None,
+    ) -> Union[InputFileBig, InputFile]:
+        file_size = file_path.stat().st_size
+        if file_size < 1024 * 1024:
+            return await self.client.upload_file(
+                str(file_path),
+                file_name=file_name,
+                part_size_kb=512,
+                progress_callback=progress_callback,
+            )
+
+        try:
+            if not self.senders:
+                await self.start()
+            if not self.senders:
+                raise RuntimeError("No parallel senders available")
+            return await self._parallel_upload(file_path, file_size, file_name, progress_callback)
+        except Exception as exc:
+            print(f"[warn] parallel upload failed ({exc}), falling back to standard upload", file=sys.stderr)
+            await self.close()
+            return await self.client.upload_file(
+                str(file_path),
+                file_name=file_name,
+                part_size_kb=512,
+                progress_callback=progress_callback,
+            )
+
+    async def _parallel_upload(
+        self,
+        file_path: Path,
+        file_size: int,
+        file_name: str,
+        progress_callback: Optional[Callable[[int, int], Any]] = None,
+    ) -> Union[InputFileBig, InputFile]:
+        part_size = 512 * 1024  # 512 KB max allowed MTProto chunk size
+        part_count = (file_size + part_size - 1) // part_size
+        is_big = file_size > 10 * 1024 * 1024
+        file_id = helpers.generate_random_long()
+
+        md5_hex = ""
+        if not is_big:
+            def calc_md5() -> str:
+                h = hashlib.md5()
+                with open(file_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        h.update(chunk)
+                return h.hexdigest()
+
+            md5_hex = await asyncio.to_thread(calc_md5)
+
+        workers_per_sender = 2
+        total_workers = len(self.senders) * workers_per_sender
+        queue: asyncio.Queue[Optional[tuple[int, bytes]]] = asyncio.Queue(maxsize=total_workers)
+        uploaded_bytes = 0
+        progress_lock = asyncio.Lock()
+        first_error: list[BaseException] = []
+
+        async def producer() -> None:
+            try:
+                with open(file_path, "rb") as f:
+                    for part_index in range(part_count):
+                        if first_error:
+                            break
+                        data = await asyncio.to_thread(f.read, part_size)
+                        if not data:
+                            break
+                        await queue.put((part_index, data))
+            except BaseException as exc:
+                if not first_error:
+                    first_error.append(exc)
+            finally:
+                for _ in range(total_workers):
+                    await queue.put(None)
+
+        async def worker(sender: MTProtoSender) -> None:
+            nonlocal uploaded_bytes
+            while True:
+                item = await queue.get()
+                if item is None:
+                    queue.task_done()
+                    return
+                part_index, data = item
+                try:
+                    if first_error:
+                        continue
+                    req = (
+                        SaveBigFilePartRequest(file_id, part_index, part_count, data)
+                        if is_big
+                        else SaveFilePartRequest(file_id, part_index, data)
+                    )
+                    for attempt in range(4):
+                        try:
+                            ok = await sender.send(req)
+                            if ok:
+                                break
+                            raise RuntimeError(f"SavePart returned False for part {part_index}")
+                        except FloodWaitError as exc:
+                            await asyncio.sleep(exc.seconds + 1)
+                        except Exception:
+                            if attempt == 3:
+                                raise
+                            await asyncio.sleep(1 + attempt)
+
+                    async with progress_lock:
+                        uploaded_bytes += len(data)
+                        cur = uploaded_bytes
+                    if progress_callback:
+                        res = progress_callback(cur, file_size)
+                        if asyncio.iscoroutine(res):
+                            await res
+                except BaseException as exc:
+                    if not first_error:
+                        first_error.append(exc)
+                finally:
+                    queue.task_done()
+
+        worker_tasks = [
+            asyncio.create_task(worker(sender))
+            for sender in self.senders
+            for _ in range(workers_per_sender)
+        ]
+        prod_task = asyncio.create_task(producer())
+        await asyncio.gather(prod_task, *worker_tasks)
+
+        if first_error:
+            raise first_error[0]
+
+        if is_big:
+            return InputFileBig(file_id, part_count, file_name)
+        return InputFile(file_id, part_count, file_name, md5_checksum=md5_hex)
+
+
 async def upload_media(
     client: TelegramClient,
+    fast_uploader: FastUploader,
     chat_id: int,
     media_path: Path,
     thumb_path: Optional[Path],
@@ -511,6 +716,7 @@ async def upload_media(
 
     if quality == "mp3":
         file_name = f"{sanitize_filename(title)}.mp3"
+        mime_type = "audio/mpeg"
         attributes = [
             DocumentAttributeAudio(
                 duration=duration,
@@ -523,6 +729,7 @@ async def upload_media(
     else:
         ext = media_path.suffix.lstrip(".") or "mp4"
         file_name = f"{sanitize_filename(title)}.{ext}"
+        mime_type = mimetypes.guess_type(file_name)[0] or "video/mp4"
         attributes = [
             DocumentAttributeVideo(
                 duration=duration,
@@ -551,20 +758,26 @@ async def upload_media(
         )
 
     await status.update(
-        f"{header}\n⬆️ جاري الرفع إلى تليجرام ({format_bytes(media_path.stat().st_size)})...",
+        f"{header}\n⬆️ جاري الرفع السريع إلى تليجرام ({format_bytes(media_path.stat().st_size)})...",
         force=True,
+    )
+
+    uploaded_file = await fast_uploader.upload(
+        media_path,
+        file_name=file_name,
+        progress_callback=upload_progress,
     )
 
     for attempt in range(3):
         try:
             await client.send_file(
                 chat_id,
-                file=str(media_path),
+                file=uploaded_file,
+                mime_type=mime_type,
                 caption=truncate_text(caption, 1020),
                 thumb=str(thumb_path) if thumb_path and thumb_path.exists() else None,
                 attributes=attributes,
                 supports_streaming=supports_streaming,
-                progress_callback=upload_progress,
             )
             return
         except FloodWaitError as exc:
@@ -619,6 +832,7 @@ async def main() -> int:
 
     cookies_path = prepare_cookies_file(raw_cookies)
     client = TelegramClient(MemorySession(), api_id, api_hash)
+    fast_uploader = FastUploader(client, connections=8)
 
     try:
         await client.start(bot_token=bot_token)
@@ -687,6 +901,7 @@ async def main() -> int:
 
                 await upload_media(
                     client=client,
+                    fast_uploader=fast_uploader,
                     chat_id=chat_id,
                     media_path=media_path,
                     thumb_path=thumb_path,
@@ -747,6 +962,7 @@ async def main() -> int:
             pass
         return 1
     finally:
+        await fast_uploader.close()
         await client.disconnect()
         if cookies_path and cookies_path.exists():
             cookies_path.unlink(missing_ok=True)
