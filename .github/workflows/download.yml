@@ -105,7 +105,9 @@ jobs:
 
       - name: Install Python dependencies (uv)
         run: |
-          uv venv .venv --python 3.12
+          if [ ! -x .venv/bin/python ]; then
+            uv venv --clear .venv --python 3.12
+          fi
           uv pip install --python .venv/bin/python --upgrade-package yt-dlp -r requirements.txt
 
       - name: Download and upload to Telegram
@@ -125,3 +127,32 @@ jobs:
           DOWNLOAD_CONCURRENCY: "3"
           UPLOAD_CONCURRENCY: "2"
         run: .venv/bin/python scripts/downloader.py
+
+      - name: Notify Telegram on workflow setup failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          STATUS_MSG_ID: ${{ inputs.status_msg_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat_id = os.environ["CHAT_ID"]
+          msg_id = int(os.environ.get("STATUS_MSG_ID") or "0")
+          text = "❌ حدث خطأ غير متوقع أثناء تشغيل المهمة على GitHub Actions."
+          method = "editMessageText" if msg_id else "sendMessage"
+          payload = {"chat_id": chat_id, "text": text}
+          if msg_id:
+              payload["message_id"] = msg_id
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{token}/{method}",
+              data=json.dumps(payload).encode(),
+              headers={"content-type": "application/json"},
+              method="POST",
+          )
+          try:
+              urllib.request.urlopen(req, timeout=10)
+          except Exception:
+              pass
+          PY
