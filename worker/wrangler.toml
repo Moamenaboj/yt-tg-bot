@@ -1,0 +1,15 @@
+name = "yt-tg-bot"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+GITHUB_BRANCH = "main"
+# Set these non-secret vars here OR in Cloudflare Dashboard -> Settings -> Variables and Secrets:
+# GITHUB_OWNER = "your-github-username"
+# GITHUB_REPO = "yt-tg-bot"
+# ALLOWED_USER_IDS = "123456789"
+
+# Required Secrets (set via `wrangler secret put <NAME>` or Cloudflare Dashboard):
+# - TELEGRAM_BOT_TOKEN
+# - TELEGRAM_WEBHOOK_SECRET
+# - GITHUB_TOKEN

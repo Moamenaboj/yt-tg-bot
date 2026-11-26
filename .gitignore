@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+cookies.txt
+*.session
+*.session-journal
+worker/node_modules/
+worker/.wrangler/
+worker/.dev.vars
+.env
