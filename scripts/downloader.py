@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-YouTube Video & Playlist Downloader -> Telegram (up to 2 GB via Telethon MTProto).
-Designed to run inside GitHub Actions triggered by a Cloudflare Worker.
+High-Speed YouTube Video & Playlist Downloader -> Telegram (up to 2 GB via Telethon MTProto).
+
+Features:
+- 3-stage async playlist pipeline: concurrent downloads + concurrent parallel MTProto uploads
+  + strict-order Telegram delivery (#1, #2, #3, ...).
+- FastUploader: 12 parallel MTProtoSender connections with 512 KB pipelined chunks.
+- Automatic quality fallback when a video exceeds Telegram's 2 GB limit.
+- Immediate temp-directory cleanup after each upload stage to keep disk usage minimal.
 """
 
 import asyncio
 import base64
+from dataclasses import dataclass
 import hashlib
 import json
 import mimetypes
@@ -86,7 +93,6 @@ def prepare_cookies_file(raw_secret: str) -> Optional[Path]:
         return None
 
     decoded_text = content
-    # If it doesn't look like tab-separated Netscape cookies, try base64 decoding
     if "\t" not in content and "# Netscape" not in content and "# HTTP Cookie" not in content:
         try:
             raw_bytes = base64.b64decode(content, validate=True)
@@ -114,7 +120,7 @@ class StatusTracker:
         client: TelegramClient,
         chat_id: int,
         message_id: int = 0,
-        min_interval: float = 4.5,
+        min_interval: float = 4.0,
     ):
         self.client = client
         self.chat_id = chat_id
@@ -191,6 +197,57 @@ class StatusTracker:
                 print(f"[warn] status update failed: {exc}", file=sys.stderr)
 
 
+class PlaylistDashboard:
+    """Aggregates concurrent download/upload progress into one clean status message."""
+
+    def __init__(
+        self,
+        status: StatusTracker,
+        playlist_title: str,
+        total: int,
+        was_capped: bool = False,
+        max_videos: int = 100,
+    ):
+        self.status = status
+        self.playlist_title = truncate_text(playlist_title, 100)
+        self.total = total
+        self.was_capped = was_capped
+        self.max_videos = max_videos
+        self.done_count = 0
+        self.fail_count = 0
+        self.active: dict[int, tuple[str, str]] = {}  # idx -> (phase, detail)
+
+    def render(self) -> str:
+        uploading = sum(1 for phase, _ in self.active.values() if phase == "⬆️")
+        downloading = sum(1 for phase, _ in self.active.values() if phase == "⬇️")
+        lines = [
+            f"📋 البلايليست: {self.playlist_title}",
+            f"✅ تم: {self.done_count}/{self.total}  |  ⬆️ يرفع: {uploading}  |  ⬇️ يحمّل: {downloading}",
+        ]
+        if self.fail_count:
+            lines[-1] += f"  |  ❌ فشل: {self.fail_count}"
+        if self.was_capped:
+            lines.append(
+                f"ℹ️ تم تحديد أول {self.max_videos} فيديو (أرسل نطاقاً مثل 101-200 لاستكمال الباقي)."
+            )
+        for idx in sorted(self.active.keys())[:8]:
+            phase, detail = self.active[idx]
+            lines.append(f"• {phase} #{idx}: {detail}")
+        return "\n".join(lines)
+
+    async def set_active(self, idx: int, phase: str, detail: str, force: bool = False) -> None:
+        self.active[idx] = (phase, detail)
+        await self.status.update(self.render(), force=force)
+
+    async def mark_done(self, idx: int, succeeded: bool) -> None:
+        self.active.pop(idx, None)
+        if succeeded:
+            self.done_count += 1
+        else:
+            self.fail_count += 1
+        await self.status.update(self.render(), force=False)
+
+
 def build_base_ydl_opts(cookies_path: Optional[Path]) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -199,6 +256,7 @@ def build_base_ydl_opts(cookies_path: Optional[Path]) -> dict[str, Any]:
         "fragment_retries": 5,
         "file_access_retries": 3,
         "concurrent_fragment_downloads": 8,
+        "http_chunk_size": 10 * 1024 * 1024,
         "socket_timeout": 30,
         "source_address": "0.0.0.0",
         "js_runtimes": {"deno": {}},
@@ -232,7 +290,6 @@ def extract_playlist_entries(
     if playlist_items:
         opts["playlist_items"] = playlist_items
     else:
-        # Request 1 extra item to detect whether playlist exceeds max_videos
         opts["playlist_items"] = f"1-{max_videos + 1}"
 
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -243,7 +300,6 @@ def extract_playlist_entries(
 
     entries = info.get("entries")
     if entries is None:
-        # Single video fallback
         return (
             info.get("title") or "YouTube Video",
             [{"url": info.get("webpage_url") or url, "title": info.get("title") or ""}],
@@ -320,7 +376,6 @@ def download_single_sync(
     if not info:
         raise RuntimeError("فشل استخراج بيانات الفيديو.")
 
-    # Resolve final postprocessed file path
     media_path: Optional[Path] = None
     requested = info.get("requested_downloads") or []
     for item in requested:
@@ -401,7 +456,6 @@ def probe_media(file_path: Path, info: dict[str, Any]) -> tuple[int, int, int]:
                 if stream.get("codec_type") == "video":
                     w = int(stream.get("width") or 0)
                     h = int(stream.get("height") or 0)
-                    # Check rotation metadata (important for vertical Shorts)
                     rotation = 0
                     tags = stream.get("tags") or {}
                     if "rotate" in tags:
@@ -431,8 +485,7 @@ async def download_with_size_fallback(
     requested_quality: str,
     work_dir: Path,
     cookies_path: Optional[Path],
-    status: StatusTracker,
-    header: str,
+    on_status: Callable[[str, bool], Any],
 ) -> tuple[Path, dict[str, Any], str]:
     """Downloads media; if video exceeds 1.98 GB, automatically steps down quality."""
     loop = asyncio.get_running_loop()
@@ -449,7 +502,6 @@ async def download_with_size_fallback(
 
     last_size = 0
     for q in qualities_to_try:
-        # Clean previous attempt artifacts inside work_dir
         for child in work_dir.iterdir():
             if child.is_file():
                 child.unlink(missing_ok=True)
@@ -461,7 +513,7 @@ async def download_with_size_fallback(
             if d.get("status") != "downloading":
                 return
             now = time.monotonic()
-            if now - last_hook_ts < 4.5:
+            if now - last_hook_ts < 3.5:
                 return
             last_hook_ts = now
             downloaded = d.get("downloaded_bytes") or 0
@@ -469,17 +521,14 @@ async def download_with_size_fallback(
             speed = d.get("speed") or 0
             if total > 0:
                 pct = min(100.0, (downloaded / total) * 100.0)
-                line = f"⬇️ التحميل ({q}): {pct:.0f}% ({format_bytes(downloaded)} / {format_bytes(total)})"
+                line = f"{pct:.0f}% ({format_bytes(downloaded)} / {format_bytes(total)})"
             else:
-                line = f"⬇️ التحميل ({q}): {format_bytes(downloaded)}"
+                line = f"{format_bytes(downloaded)}"
             if speed:
                 line += f" • {format_bytes(speed)}/s"
-            asyncio.run_coroutine_threadsafe(
-                status.update(f"{header}\n{line}"),
-                loop,
-            )
+            asyncio.run_coroutine_threadsafe(on_status(line, False), loop)
 
-        await status.update(f"{header}\n⬇️ جاري التحميل ({q})...", force=True)
+        await on_status(f"جاري التحميل ({q})...", False)
         media_path, info = await asyncio.to_thread(
             download_single_sync,
             url,
@@ -494,9 +543,9 @@ async def download_with_size_fallback(
             return media_path, info, q
 
         if q != qualities_to_try[-1]:
-            await status.update(
-                f"{header}\n⚠️ حجم الملف ({format_bytes(last_size)}) يتجاوز حد 2 GB — جاري التجربة بجودة أقل...",
-                force=True,
+            await on_status(
+                f"⚠️ الحجم ({format_bytes(last_size)}) > 2 GB — تجربة جودة أقل...",
+                True,
             )
 
     raise RuntimeError(
@@ -507,65 +556,73 @@ async def download_with_size_fallback(
 class FastUploader:
     """
     Parallel MTProto file uploader using multiple concurrent MTProtoSender
-    connections to the bot's DC with 512 KB parts (typically 5x-15x faster than
-    Telethon's single-connection sequential upload_file).
+    connections to the bot's DC with 512 KB pipelined chunks.
+    Safe to share across multiple simultaneous file uploads.
     """
 
-    def __init__(self, client: TelegramClient, connections: int = 8):
+    def __init__(self, client: TelegramClient, connections: int = 12):
         self.client = client
-        self.connections = connections
+        self.connections = max(2, connections)
         self.senders: list[MTProtoSender] = []
+        self._start_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        if self.senders:
-            return
-        dc = await self.client._get_dc(self.client.session.dc_id)
+        async with self._start_lock:
+            if self.senders:
+                return
+            dc = await self.client._get_dc(self.client.session.dc_id)
 
-        async def make_sender() -> MTProtoSender:
-            sender = MTProtoSender(self.client.session.auth_key, loggers=self.client._log)
-            await sender.connect(
-                self.client._connection(
-                    dc.ip_address,
-                    dc.port,
-                    dc.id,
-                    loggers=self.client._log,
-                    proxy=self.client._proxy,
-                    local_addr=self.client._local_addr,
+            async def make_sender() -> MTProtoSender:
+                sender = MTProtoSender(
+                    self.client.session.auth_key, loggers=self.client._log
                 )
-            )
-            init_req = InitConnectionRequest(
-                api_id=self.client.api_id,
-                device_model="yt-tg-bot",
-                system_version="Linux",
-                app_version="1.0",
-                system_lang_code="en",
-                lang_pack="",
-                lang_code="en",
-                query=GetConfigRequest(),
-            )
-            await sender.send(InvokeWithLayerRequest(LAYER, init_req))
-            return sender
+                await sender.connect(
+                    self.client._connection(
+                        dc.ip_address,
+                        dc.port,
+                        dc.id,
+                        loggers=self.client._log,
+                        proxy=self.client._proxy,
+                        local_addr=self.client._local_addr,
+                    )
+                )
+                init_req = InitConnectionRequest(
+                    api_id=self.client.api_id,
+                    device_model="yt-tg-bot",
+                    system_version="Linux",
+                    app_version="2.0",
+                    system_lang_code="en",
+                    lang_pack="",
+                    lang_code="en",
+                    query=GetConfigRequest(),
+                )
+                await sender.send(InvokeWithLayerRequest(LAYER, init_req))
+                return sender
 
-        results = await asyncio.gather(
-            *(make_sender() for _ in range(self.connections)),
-            return_exceptions=True,
-        )
-        for item in results:
-            if isinstance(item, MTProtoSender):
-                self.senders.append(item)
-            else:
-                print(f"[warn] parallel sender init failed: {item}", file=sys.stderr)
+            results = await asyncio.gather(
+                *(make_sender() for _ in range(self.connections)),
+                return_exceptions=True,
+            )
+            for item in results:
+                if isinstance(item, MTProtoSender):
+                    self.senders.append(item)
+                else:
+                    print(f"[warn] parallel sender init failed: {item}", file=sys.stderr)
 
     async def close(self) -> None:
-        if not self.senders:
-            return
-        await asyncio.gather(*(s.disconnect() for s in self.senders), return_exceptions=True)
-        self.senders.clear()
+        async with self._start_lock:
+            if not self.senders:
+                return
+            await asyncio.gather(
+                *(s.disconnect() for s in self.senders), return_exceptions=True
+            )
+            self.senders.clear()
 
     async def upload(
         self,
         file_path: Path,
         file_name: str,
+        workers_per_sender: int = 2,
         progress_callback: Optional[Callable[[int, int], Any]] = None,
     ) -> Union[InputFileBig, InputFile]:
         file_size = file_path.stat().st_size
@@ -582,10 +639,18 @@ class FastUploader:
                 await self.start()
             if not self.senders:
                 raise RuntimeError("No parallel senders available")
-            return await self._parallel_upload(file_path, file_size, file_name, progress_callback)
+            return await self._parallel_upload(
+                file_path,
+                file_size,
+                file_name,
+                workers_per_sender=workers_per_sender,
+                progress_callback=progress_callback,
+            )
         except Exception as exc:
-            print(f"[warn] parallel upload failed ({exc}), falling back to standard upload", file=sys.stderr)
-            await self.close()
+            print(
+                f"[warn] parallel upload failed ({exc}), falling back to standard upload",
+                file=sys.stderr,
+            )
             return await self.client.upload_file(
                 str(file_path),
                 file_name=file_name,
@@ -598,6 +663,7 @@ class FastUploader:
         file_path: Path,
         file_size: int,
         file_name: str,
+        workers_per_sender: int = 2,
         progress_callback: Optional[Callable[[int, int], Any]] = None,
     ) -> Union[InputFileBig, InputFile]:
         part_size = 512 * 1024  # 512 KB max allowed MTProto chunk size
@@ -616,9 +682,11 @@ class FastUploader:
 
             md5_hex = await asyncio.to_thread(calc_md5)
 
-        workers_per_sender = 2
-        total_workers = len(self.senders) * workers_per_sender
-        queue: asyncio.Queue[Optional[tuple[int, bytes]]] = asyncio.Queue(maxsize=total_workers)
+        senders = list(self.senders)
+        total_workers = len(senders) * max(1, workers_per_sender)
+        queue: asyncio.Queue[Optional[tuple[int, bytes]]] = asyncio.Queue(
+            maxsize=total_workers
+        )
         uploaded_bytes = 0
         progress_lock = asyncio.Lock()
         first_error: list[BaseException] = []
@@ -661,7 +729,9 @@ class FastUploader:
                             ok = await sender.send(req)
                             if ok:
                                 break
-                            raise RuntimeError(f"SavePart returned False for part {part_index}")
+                            raise RuntimeError(
+                                f"SavePart returned False for part {part_index}"
+                            )
                         except FloodWaitError as exc:
                             await asyncio.sleep(exc.seconds + 1)
                         except Exception:
@@ -684,8 +754,8 @@ class FastUploader:
 
         worker_tasks = [
             asyncio.create_task(worker(sender))
-            for sender in self.senders
-            for _ in range(workers_per_sender)
+            for sender in senders
+            for _ in range(max(1, workers_per_sender))
         ]
         prod_task = asyncio.create_task(producer())
         await asyncio.gather(prod_task, *worker_tasks)
@@ -698,22 +768,16 @@ class FastUploader:
         return InputFile(file_id, part_count, file_name, md5_checksum=md5_hex)
 
 
-async def upload_media(
-    client: TelegramClient,
-    fast_uploader: FastUploader,
-    chat_id: int,
+def build_media_metadata(
     media_path: Path,
-    thumb_path: Optional[Path],
     info: dict[str, Any],
     quality: str,
-    caption: str,
-    status: StatusTracker,
-    header: str,
-) -> None:
+    duration: int,
+    width: int,
+    height: int,
+) -> tuple[str, str, list[Any], bool]:
     title = (info.get("title") or media_path.stem).strip()
     uploader = (info.get("uploader") or info.get("channel") or "YouTube").strip()
-    duration, width, height = await asyncio.to_thread(probe_media, media_path, info)
-
     if quality == "mp3":
         file_name = f"{sanitize_filename(title)}.mp3"
         mime_type = "audio/mpeg"
@@ -725,72 +789,51 @@ async def upload_media(
             ),
             DocumentAttributeFilename(file_name=file_name),
         ]
-        supports_streaming = False
-    else:
-        ext = media_path.suffix.lstrip(".") or "mp4"
-        file_name = f"{sanitize_filename(title)}.{ext}"
-        mime_type = mimetypes.guess_type(file_name)[0] or "video/mp4"
-        attributes = [
-            DocumentAttributeVideo(
-                duration=duration,
-                w=width,
-                h=height,
-                supports_streaming=True,
-            ),
-            DocumentAttributeFilename(file_name=file_name),
-        ]
-        supports_streaming = True
+        return file_name, mime_type, attributes, False
 
-    start_time = time.monotonic()
-    last_cb_ts = 0.0
+    ext = media_path.suffix.lstrip(".") or "mp4"
+    file_name = f"{sanitize_filename(title)}.{ext}"
+    mime_type = mimetypes.guess_type(file_name)[0] or "video/mp4"
+    attributes = [
+        DocumentAttributeVideo(
+            duration=duration,
+            w=width,
+            h=height,
+            supports_streaming=True,
+        ),
+        DocumentAttributeFilename(file_name=file_name),
+    ]
+    return file_name, mime_type, attributes, True
 
-    async def upload_progress(current: int, total: int) -> None:
-        nonlocal last_cb_ts
-        now = time.monotonic()
-        if now - last_cb_ts < 4.5 and current < total:
-            return
-        last_cb_ts = now
-        elapsed = max(0.1, now - start_time)
-        speed = current / elapsed
-        pct = min(100.0, (current / max(1, total)) * 100.0)
-        await status.update(
-            f"{header}\n⬆️ جاري الرفع: {pct:.0f}% ({format_bytes(current)} / {format_bytes(total)}) • {format_bytes(speed)}/s"
-        )
 
-    await status.update(
-        f"{header}\n⬆️ جاري الرفع السريع إلى تليجرام ({format_bytes(media_path.stat().st_size)})...",
-        force=True,
-    )
-
-    uploaded_file = await fast_uploader.upload(
-        media_path,
-        file_name=file_name,
-        progress_callback=upload_progress,
-    )
-
-    for attempt in range(3):
+async def deliver_uploaded_media(
+    client: TelegramClient,
+    chat_id: int,
+    uploaded_file: Any,
+    uploaded_thumb: Any,
+    mime_type: str,
+    attributes: list[Any],
+    caption: str,
+    supports_streaming: bool,
+) -> None:
+    for attempt in range(4):
         try:
             await client.send_file(
                 chat_id,
                 file=uploaded_file,
                 mime_type=mime_type,
                 caption=truncate_text(caption, 1020),
-                thumb=str(thumb_path) if thumb_path and thumb_path.exists() else None,
+                thumb=uploaded_thumb,
                 attributes=attributes,
                 supports_streaming=supports_streaming,
             )
             return
         except FloodWaitError as exc:
-            wait_sec = exc.seconds + 2
-            await status.update(
-                f"{header}\n⏳ تليجرام طلب الانتظار {wait_sec} ثانية (FloodWait)...",
-                force=True,
-            )
-            await asyncio.sleep(wait_sec)
+            await asyncio.sleep(exc.seconds + 2)
         except Exception:
-            if attempt == 2:
+            if attempt == 3:
                 raise
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
 
 def is_bot_block_error(exc: Exception) -> bool:
@@ -806,6 +849,407 @@ def short_error(exc: Exception) -> str:
     return truncate_text(text, 180)
 
 
+@dataclass
+class DownloadedItem:
+    idx: int
+    title: str
+    media_path: Path
+    thumb_path: Optional[Path]
+    info: dict[str, Any]
+    actual_quality: str
+    duration: int
+    width: int
+    height: int
+    work_dir: Path
+
+
+@dataclass
+class ReadyToSend:
+    idx: int
+    uploaded_file: Any
+    uploaded_thumb: Any
+    mime_type: str
+    attributes: list[Any]
+    caption: str
+    supports_streaming: bool
+
+
+@dataclass
+class PipelineError:
+    idx: int
+    message: str
+    skipped: bool = False
+
+
+async def run_single_video(
+    client: TelegramClient,
+    fast_uploader: FastUploader,
+    chat_id: int,
+    url: str,
+    quality: str,
+    cookies_path: Optional[Path],
+    status: StatusTracker,
+) -> None:
+    header = "🎬 جاري معالجة الفيديو..."
+    work_dir = Path(tempfile.mkdtemp(prefix="ytdl_"))
+    try:
+        async def on_dl_status(line: str, force: bool) -> None:
+            await status.update(f"{header}\n⬇️ {line}", force=force)
+
+        media_path, info, actual_quality = await download_with_size_fallback(
+            url=url,
+            requested_quality=quality,
+            work_dir=work_dir,
+            cookies_path=cookies_path,
+            on_status=on_dl_status,
+        )
+
+        title = (info.get("title") or "YouTube").strip()
+        header = f"🎬 {truncate_text(title, 80)}"
+        thumb_path, (duration, width, height) = await asyncio.gather(
+            asyncio.to_thread(prepare_thumbnail, work_dir),
+            asyncio.to_thread(probe_media, media_path, info),
+        )
+        file_name, mime_type, attributes, supports_streaming = build_media_metadata(
+            media_path, info, actual_quality, duration, width, height
+        )
+
+        start_time = time.monotonic()
+        last_cb_ts = 0.0
+
+        async def upload_progress(current: int, total: int) -> None:
+            nonlocal last_cb_ts
+            now = time.monotonic()
+            if now - last_cb_ts < 3.5 and current < total:
+                return
+            last_cb_ts = now
+            elapsed = max(0.1, now - start_time)
+            speed = current / elapsed
+            pct = min(100.0, (current / max(1, total)) * 100.0)
+            await status.update(
+                f"{header}\n⬆️ جاري الرفع السريع: {pct:.0f}% ({format_bytes(current)} / {format_bytes(total)}) • {format_bytes(speed)}/s"
+            )
+
+        await status.update(
+            f"{header}\n⬆️ جاري الرفع السريع ({format_bytes(media_path.stat().st_size)})...",
+            force=True,
+        )
+
+        # Single video gets 3 pipelined workers per sender (12 * 3 = 36 chunks in flight)
+        uploaded_file = await fast_uploader.upload(
+            media_path,
+            file_name=file_name,
+            workers_per_sender=3,
+            progress_callback=upload_progress,
+        )
+        uploaded_thumb = (
+            await client.upload_file(str(thumb_path))
+            if thumb_path and thumb_path.exists()
+            else None
+        )
+
+        caption = title
+        if actual_quality != quality and quality != "mp3":
+            caption += f"\n({actual_quality}p)"
+
+        await deliver_uploaded_media(
+            client=client,
+            chat_id=chat_id,
+            uploaded_file=uploaded_file,
+            uploaded_thumb=uploaded_thumb,
+            mime_type=mime_type,
+            attributes=attributes,
+            caption=caption,
+            supports_streaming=supports_streaming,
+        )
+        await status.update("✅ تم التحميل والرفع بنجاح!", force=True)
+    except Exception as exc:
+        print(f"[error] single video ({url}): {exc}", file=sys.stderr)
+        await status.update(f"❌ فشل التحميل:\n• {short_error(exc)}", force=True)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+async def run_playlist_pipeline(
+    client: TelegramClient,
+    fast_uploader: FastUploader,
+    chat_id: int,
+    playlist_title: str,
+    items: list[dict[str, str]],
+    quality: str,
+    was_capped: bool,
+    max_playlist_videos: int,
+    cookies_path: Optional[Path],
+    status: StatusTracker,
+    download_concurrency: int = 3,
+    upload_concurrency: int = 2,
+) -> None:
+    total = len(items)
+    dl_workers_n = min(max(1, download_concurrency), total)
+    up_workers_n = min(max(1, upload_concurrency), total)
+
+    dashboard = PlaylistDashboard(
+        status=status,
+        playlist_title=playlist_title,
+        total=total,
+        was_capped=was_capped,
+        max_videos=max_playlist_videos,
+    )
+    await status.update(dashboard.render(), force=True)
+
+    # Pre-warm parallel MTProto senders while initial downloads run
+    prewarm_task = asyncio.create_task(fast_uploader.start())
+
+    dl_queue: asyncio.Queue[Optional[tuple[int, dict[str, str]]]] = asyncio.Queue()
+    for idx, item in enumerate(items, start=1):
+        await dl_queue.put((idx, item))
+    for _ in range(dl_workers_n):
+        await dl_queue.put(None)
+
+    # Bound total live temp dirs on disk
+    disk_sem = asyncio.Semaphore(dl_workers_n + up_workers_n)
+    up_queue: asyncio.Queue[Optional[Union[DownloadedItem, PipelineError]]] = asyncio.Queue(
+        maxsize=up_workers_n + 2
+    )
+
+    ready_map: dict[int, Union[ReadyToSend, PipelineError]] = {}
+    ready_event = asyncio.Event()
+
+    abort_event = asyncio.Event()
+    bot_block_lock = asyncio.Lock()
+    consecutive_bot_blocks = 0
+
+    def publish_ready(idx: int, obj: Union[ReadyToSend, PipelineError]) -> None:
+        ready_map[idx] = obj
+        ready_event.set()
+
+    async def download_worker() -> None:
+        nonlocal consecutive_bot_blocks
+        while True:
+            entry = await dl_queue.get()
+            if entry is None:
+                dl_queue.task_done()
+                return
+            idx, item = entry
+            try:
+                if abort_event.is_set():
+                    publish_ready(idx, PipelineError(idx=idx, message="", skipped=True))
+                    continue
+
+                await disk_sem.acquire()
+                work_dir = Path(tempfile.mkdtemp(prefix=f"ytdl_{idx}_"))
+                handed_off = False
+                try:
+                    async def on_dl_status(line: str, force: bool, _idx: int = idx) -> None:
+                        await dashboard.set_active(_idx, "⬇️", line, force=force)
+
+                    media_path, info, actual_quality = await download_with_size_fallback(
+                        url=item["url"],
+                        requested_quality=quality,
+                        work_dir=work_dir,
+                        cookies_path=cookies_path,
+                        on_status=on_dl_status,
+                    )
+                    title = (info.get("title") or item.get("title") or "YouTube").strip()
+                    thumb_path, (duration, width, height) = await asyncio.gather(
+                        asyncio.to_thread(prepare_thumbnail, work_dir),
+                        asyncio.to_thread(probe_media, media_path, info),
+                    )
+                    async with bot_block_lock:
+                        consecutive_bot_blocks = 0
+
+                    await dashboard.set_active(
+                        idx, "⏳", f"جاهز للرفع ({format_bytes(media_path.stat().st_size)})"
+                    )
+                    await up_queue.put(
+                        DownloadedItem(
+                            idx=idx,
+                            title=title,
+                            media_path=media_path,
+                            thumb_path=thumb_path,
+                            info=info,
+                            actual_quality=actual_quality,
+                            duration=duration,
+                            width=width,
+                            height=height,
+                            work_dir=work_dir,
+                        )
+                    )
+                    handed_off = True
+                except Exception as exc:
+                    err_msg = short_error(exc)
+                    print(f"[error] dl #{idx}/{total} ({item['url']}): {exc}", file=sys.stderr)
+                    if is_bot_block_error(exc):
+                        async with bot_block_lock:
+                            consecutive_bot_blocks += 1
+                            if consecutive_bot_blocks >= 2:
+                                abort_event.set()
+                    else:
+                        async with bot_block_lock:
+                            consecutive_bot_blocks = 0
+                    await dashboard.mark_done(idx, succeeded=False)
+                    publish_ready(idx, PipelineError(idx=idx, message=f"• #{idx}: {err_msg}"))
+                finally:
+                    if not handed_off:
+                        shutil.rmtree(work_dir, ignore_errors=True)
+                        disk_sem.release()
+            finally:
+                dl_queue.task_done()
+
+    async def upload_worker() -> None:
+        await prewarm_task
+        while True:
+            item = await up_queue.get()
+            if item is None:
+                up_queue.task_done()
+                return
+            try:
+                if isinstance(item, PipelineError):
+                    publish_ready(item.idx, item)
+                    continue
+
+                try:
+                    file_name, mime_type, attributes, supports_streaming = build_media_metadata(
+                        item.media_path,
+                        item.info,
+                        item.actual_quality,
+                        item.duration,
+                        item.width,
+                        item.height,
+                    )
+                    file_size = item.media_path.stat().st_size
+                    start_time = time.monotonic()
+                    last_cb_ts = 0.0
+
+                    async def on_up_progress(
+                        current: int, total_b: int, _idx: int = item.idx
+                    ) -> None:
+                        nonlocal last_cb_ts
+                        now = time.monotonic()
+                        if now - last_cb_ts < 3.5 and current < total_b:
+                            return
+                        last_cb_ts = now
+                        elapsed = max(0.1, now - start_time)
+                        speed = current / elapsed
+                        pct = min(100.0, (current / max(1, total_b)) * 100.0)
+                        await dashboard.set_active(
+                            _idx, "⬆️", f"{pct:.0f}% • {format_bytes(speed)}/s"
+                        )
+
+                    await dashboard.set_active(
+                        item.idx, "⬆️", f"0% ({format_bytes(file_size)})"
+                    )
+                    uploaded_file = await fast_uploader.upload(
+                        item.media_path,
+                        file_name=file_name,
+                        workers_per_sender=2,
+                        progress_callback=on_up_progress,
+                    )
+                    uploaded_thumb = (
+                        await client.upload_file(str(item.thumb_path))
+                        if item.thumb_path and item.thumb_path.exists()
+                        else None
+                    )
+
+                    caption = f"[{item.idx}/{total}] {item.title}"
+                    if item.actual_quality != quality and quality != "mp3":
+                        caption += f"\n({item.actual_quality}p)"
+
+                    await dashboard.set_active(item.idx, "📨", "بانتظار دوره للإرسال")
+                    publish_ready(
+                        item.idx,
+                        ReadyToSend(
+                            idx=item.idx,
+                            uploaded_file=uploaded_file,
+                            uploaded_thumb=uploaded_thumb,
+                            mime_type=mime_type,
+                            attributes=attributes,
+                            caption=caption,
+                            supports_streaming=supports_streaming,
+                        ),
+                    )
+                except Exception as exc:
+                    err_msg = short_error(exc)
+                    print(f"[error] upload #{item.idx}/{total}: {exc}", file=sys.stderr)
+                    await dashboard.mark_done(item.idx, succeeded=False)
+                    publish_ready(
+                        item.idx,
+                        PipelineError(idx=item.idx, message=f"• #{item.idx}: {err_msg}"),
+                    )
+                finally:
+                    # Free local disk immediately once uploaded to Telegram staging
+                    shutil.rmtree(item.work_dir, ignore_errors=True)
+                    disk_sem.release()
+            finally:
+                up_queue.task_done()
+
+    succeeded = 0
+    failed: list[str] = []
+
+    async def ordered_sender() -> None:
+        nonlocal succeeded
+        for expected_idx in range(1, total + 1):
+            while expected_idx not in ready_map:
+                ready_event.clear()
+                if expected_idx in ready_map:
+                    break
+                await ready_event.wait()
+
+            entry = ready_map.pop(expected_idx)
+            if isinstance(entry, PipelineError):
+                if not entry.skipped and entry.message:
+                    failed.append(entry.message)
+                continue
+
+            try:
+                await deliver_uploaded_media(
+                    client=client,
+                    chat_id=chat_id,
+                    uploaded_file=entry.uploaded_file,
+                    uploaded_thumb=entry.uploaded_thumb,
+                    mime_type=entry.mime_type,
+                    attributes=entry.attributes,
+                    caption=entry.caption,
+                    supports_streaming=entry.supports_streaming,
+                )
+                succeeded += 1
+                await dashboard.mark_done(expected_idx, succeeded=True)
+            except Exception as exc:
+                err_msg = short_error(exc)
+                print(f"[error] send #{expected_idx}/{total}: {exc}", file=sys.stderr)
+                failed.append(f"• #{expected_idx}: {err_msg}")
+                await dashboard.mark_done(expected_idx, succeeded=False)
+
+            if expected_idx < total:
+                await asyncio.sleep(0.5)
+
+    dl_tasks = [asyncio.create_task(download_worker()) for _ in range(dl_workers_n)]
+    up_tasks = [asyncio.create_task(upload_worker()) for _ in range(up_workers_n)]
+    send_task = asyncio.create_task(ordered_sender())
+
+    await asyncio.gather(*dl_tasks)
+    for _ in range(up_workers_n):
+        await up_queue.put(None)
+    await asyncio.gather(*up_tasks)
+    await send_task
+
+    aborted = abort_event.is_set()
+    lines = [
+        f"{'⛔ توقف' if aborted else '✅ انتهى'} تحميل البلايليست: {truncate_text(playlist_title, 100)}",
+        f"✔️ نجح: {succeeded} / {total}",
+    ]
+    if aborted:
+        lines.append(
+            "⚠️ تم إيقاف الباقي لتفادي استهلاك الرصيد — أضف أو حدّث YOUTUBE_COOKIES في GitHub Secrets."
+        )
+    if failed:
+        lines.append(f"❌ فشل: {len(failed)}")
+        lines.extend(failed[:10])
+        if len(failed) > 10:
+            lines.append(f"... و {len(failed) - 10} أخطاء أخرى.")
+    await status.update("\n".join(lines), force=True)
+
+
 async def main() -> int:
     bot_token = env_str("TELEGRAM_BOT_TOKEN")
     api_id = env_int("TELEGRAM_API_ID")
@@ -817,6 +1261,9 @@ async def main() -> int:
     quality = env_str("QUALITY", "720").lower()
     playlist_items = env_str("PLAYLIST_ITEMS")
     max_playlist_videos = env_int("MAX_PLAYLIST_VIDEOS", 100)
+    upload_connections = env_int("UPLOAD_CONNECTIONS", 12)
+    download_concurrency = env_int("DOWNLOAD_CONCURRENCY", 3)
+    upload_concurrency = env_int("UPLOAD_CONCURRENCY", 2)
     raw_cookies = os.environ.get("YOUTUBE_COOKIES", "")
 
     if not all([bot_token, api_id, api_hash, chat_id, video_url]):
@@ -832,14 +1279,16 @@ async def main() -> int:
 
     cookies_path = prepare_cookies_file(raw_cookies)
     client = TelegramClient(MemorySession(), api_id, api_hash)
-    fast_uploader = FastUploader(client, connections=8)
+    fast_uploader = FastUploader(client, connections=upload_connections)
 
     try:
         await client.start(bot_token=bot_token)
         status = StatusTracker(client, chat_id, status_msg_id)
 
         if mode == "playlist":
-            await status.update("🔍 جاري فحص البلايليست واستخراج قائمة الفيديوهات...", force=True)
+            await status.update(
+                "🔍 جاري فحص البلايليست واستخراج قائمة الفيديوهات...", force=True
+            )
             playlist_title, items, was_capped = await asyncio.to_thread(
                 extract_playlist_entries,
                 video_url,
@@ -848,107 +1297,40 @@ async def main() -> int:
                 cookies_path,
             )
             if not items:
-                await status.update("⚠️ لم يتم العثور على أي فيديوهات متاحة في البلايليست.", force=True)
+                await status.update(
+                    "⚠️ لم يتم العثور على أي فيديوهات متاحة في البلايليست.", force=True
+                )
                 return 0
         else:
             playlist_title = ""
             items = [{"url": video_url, "title": ""}]
             was_capped = False
 
-        total = len(items)
-        succeeded = 0
-        failed: list[str] = []
-        consecutive_bot_blocks = 0
-        aborted_bot_block = False
-
-        if mode == "playlist" and total > 1:
-            intro = f"📋 البلايليست: {truncate_text(playlist_title, 120)}\n📦 عدد الفيديوهات: {total}"
-            if was_capped:
-                intro += f"\nℹ️ تم تحديد أول {max_playlist_videos} فيديو (أرسل نطاقاً مثل 101-200 لاستكمال الباقي)."
-            await status.update(intro, force=True)
-
-        for idx, item in enumerate(items, start=1):
-            item_url = item["url"]
-            item_hint = item.get("title") or ""
-            header = (
-                f"📋 [{idx}/{total}] {truncate_text(item_hint, 80)}"
-                if total > 1
-                else "🎬 جاري معالجة الفيديو..."
+        if len(items) == 1:
+            await run_single_video(
+                client=client,
+                fast_uploader=fast_uploader,
+                chat_id=chat_id,
+                url=items[0]["url"],
+                quality=quality,
+                cookies_path=cookies_path,
+                status=status,
             )
-
-            work_dir = Path(tempfile.mkdtemp(prefix="ytdl_"))
-            try:
-                media_path, info, actual_quality = await download_with_size_fallback(
-                    url=item_url,
-                    requested_quality=quality,
-                    work_dir=work_dir,
-                    cookies_path=cookies_path,
-                    status=status,
-                    header=header,
-                )
-
-                title = (info.get("title") or item_hint or "YouTube").strip()
-                header = (
-                    f"📋 [{idx}/{total}] {truncate_text(title, 80)}"
-                    if total > 1
-                    else f"🎬 {truncate_text(title, 80)}"
-                )
-                thumb_path = await asyncio.to_thread(prepare_thumbnail, work_dir)
-
-                caption = f"[{idx}/{total}] {title}" if total > 1 else title
-                if actual_quality != quality and quality != "mp3":
-                    caption += f"\n({actual_quality}p)"
-
-                await upload_media(
-                    client=client,
-                    fast_uploader=fast_uploader,
-                    chat_id=chat_id,
-                    media_path=media_path,
-                    thumb_path=thumb_path,
-                    info=info,
-                    quality=actual_quality,
-                    caption=caption,
-                    status=status,
-                    header=header,
-                )
-                succeeded += 1
-                consecutive_bot_blocks = 0
-            except Exception as exc:
-                err_msg = short_error(exc)
-                print(f"[error] item {idx}/{total} ({item_url}): {exc}", file=sys.stderr)
-                failed.append(f"• #{idx}: {err_msg}")
-                if is_bot_block_error(exc):
-                    consecutive_bot_blocks += 1
-                    if total > 1 and consecutive_bot_blocks >= 2:
-                        aborted_bot_block = True
-                        break
-                else:
-                    consecutive_bot_blocks = 0
-            finally:
-                shutil.rmtree(work_dir, ignore_errors=True)
-
-            if idx < total:
-                await asyncio.sleep(1.5)
-
-        # Final summary message
-        if total == 1:
-            if succeeded == 1:
-                await status.update("✅ تم التحميل والرفع بنجاح!", force=True)
-            else:
-                await status.update(f"❌ فشل التحميل:\n{failed[0]}", force=True)
         else:
-            lines = [
-                f"{'⛔ توقف' if aborted_bot_block else '✅ انتهى'} تحميل البلايليست: {truncate_text(playlist_title, 100)}",
-                f"✔️ نجح: {succeeded} / {total}",
-            ]
-            if aborted_bot_block:
-                lines.append("⚠️ تم إيقاف الباقي لتفادي استهلاك الرصيد — أضف أو حدّث YOUTUBE_COOKIES في GitHub Secrets.")
-            if failed:
-                lines.append(f"❌ فشل: {len(failed)}")
-                lines.extend(failed[:10])
-                if len(failed) > 10:
-                    lines.append(f"... و {len(failed) - 10} أخطاء أخرى.")
-            await status.update("\n".join(lines), force=True)
+            await run_playlist_pipeline(
+                client=client,
+                fast_uploader=fast_uploader,
+                chat_id=chat_id,
+                playlist_title=playlist_title,
+                items=items,
+                quality=quality,
+                was_capped=was_capped,
+                max_playlist_videos=max_playlist_videos,
+                cookies_path=cookies_path,
+                status=status,
+                download_concurrency=download_concurrency,
+                upload_concurrency=upload_concurrency,
+            )
 
         return 0
     except Exception as exc:
