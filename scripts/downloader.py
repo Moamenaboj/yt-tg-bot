@@ -190,7 +190,9 @@ def build_base_ydl_opts(cookies_path: Optional[Path]) -> dict[str, Any]:
         "fragment_retries": 5,
         "file_access_retries": 3,
         "socket_timeout": 30,
+        "source_address": "0.0.0.0",
         "js_runtimes": {"deno": {}},
+        "remote_components": ["ejs:github"],
     }
     if cookies_path and cookies_path.exists():
         opts["cookiefile"] = str(cookies_path)
@@ -578,11 +580,16 @@ async def upload_media(
             await asyncio.sleep(3)
 
 
+def is_bot_block_error(exc: Exception) -> bool:
+    low = str(exc).lower()
+    return "not a bot" in low or "sign in to confirm" in low
+
+
 def short_error(exc: Exception) -> str:
+    if is_bot_block_error(exc):
+        return "يوتيوب طلب التحقق (أضف أو حدّث YOUTUBE_COOKIES في GitHub Secrets)."
     msg = str(exc).strip().splitlines()
     text = msg[-1] if msg else exc.__class__.__name__
-    if "Sign in to confirm you're not a bot" in str(exc):
-        return "يوتيوب طلب التحقق (حدّث YOUTUBE_COOKIES في GitHub Secrets)."
     return truncate_text(text, 180)
 
 
@@ -637,6 +644,8 @@ async def main() -> int:
         total = len(items)
         succeeded = 0
         failed: list[str] = []
+        consecutive_bot_blocks = 0
+        aborted_bot_block = False
 
         if mode == "playlist" and total > 1:
             intro = f"📋 البلايليست: {truncate_text(playlist_title, 120)}\n📦 عدد الفيديوهات: {total}"
@@ -688,10 +697,18 @@ async def main() -> int:
                     header=header,
                 )
                 succeeded += 1
+                consecutive_bot_blocks = 0
             except Exception as exc:
                 err_msg = short_error(exc)
                 print(f"[error] item {idx}/{total} ({item_url}): {exc}", file=sys.stderr)
                 failed.append(f"• #{idx}: {err_msg}")
+                if is_bot_block_error(exc):
+                    consecutive_bot_blocks += 1
+                    if total > 1 and consecutive_bot_blocks >= 2:
+                        aborted_bot_block = True
+                        break
+                else:
+                    consecutive_bot_blocks = 0
             finally:
                 shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -706,9 +723,11 @@ async def main() -> int:
                 await status.update(f"❌ فشل التحميل:\n{failed[0]}", force=True)
         else:
             lines = [
-                f"✅ انتهى تحميل البلايليست: {truncate_text(playlist_title, 100)}",
+                f"{'⛔ توقف' if aborted_bot_block else '✅ انتهى'} تحميل البلايليست: {truncate_text(playlist_title, 100)}",
                 f"✔️ نجح: {succeeded} / {total}",
             ]
+            if aborted_bot_block:
+                lines.append("⚠️ تم إيقاف الباقي لتفادي استهلاك الرصيد — أضف أو حدّث YOUTUBE_COOKIES في GitHub Secrets.")
             if failed:
                 lines.append(f"❌ فشل: {len(failed)}")
                 lines.extend(failed[:10])
