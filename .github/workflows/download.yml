@@ -3,27 +3,30 @@ name: YouTube Telegram Downloader
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Execution mode (queue = Warm Session from Cloudflare D1)"
+        required: false
+        default: "queue"
+        type: choice
+        options:
+          - queue
+          - video
+          - playlist
       url:
-        description: "YouTube video or playlist URL"
-        required: true
+        description: "YouTube video or playlist URL (only needed for direct video/playlist mode)"
+        required: false
+        default: ""
         type: string
       chat_id:
         description: "Telegram Chat ID"
-        required: true
+        required: false
+        default: ""
         type: string
       status_msg_id:
         description: "Telegram status message ID to edit (0 to send new)"
         required: false
         default: "0"
         type: string
-      mode:
-        description: "Download mode"
-        required: false
-        default: "video"
-        type: choice
-        options:
-          - video
-          - playlist
       quality:
         description: "Target quality"
         required: false
@@ -116,6 +119,10 @@ jobs:
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+          RUNNER_SECRET: ${{ secrets.RUNNER_SECRET }}
+          WORKER_URL: "https://yt-tg-bot.momenabojbarh.workers.dev"
+          RUNNER_ID: ${{ github.run_id }}
+          WARM_IDLE_SECONDS: "240"
           CHAT_ID: ${{ inputs.chat_id }}
           STATUS_MSG_ID: ${{ inputs.status_msg_id }}
           VIDEO_URL: ${{ inputs.url }}
@@ -129,7 +136,7 @@ jobs:
         run: .venv/bin/python scripts/downloader.py
 
       - name: Notify Telegram on workflow setup failure
-        if: failure()
+        if: failure() && inputs.chat_id != ''
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}

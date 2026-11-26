@@ -4,12 +4,17 @@ compatibility_date = "2026-01-01"
 
 [vars]
 GITHUB_BRANCH = "main"
-# Set these non-secret vars here OR in Cloudflare Dashboard -> Settings -> Variables and Secrets:
-# GITHUB_OWNER = "your-github-username"
-# GITHUB_REPO = "yt-tg-bot"
-# ALLOWED_USER_IDS = "123456789"
+GITHUB_OWNER = "Moamenaboj"
+GITHUB_REPO = "yt-tg-bot"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "yt-tg-bot-db"
+database_id = "8d9c9588-72a0-466b-aeaa-b16e48101de6"
 
 # Required Secrets (set via `wrangler secret put <NAME>` or Cloudflare Dashboard):
 # - TELEGRAM_BOT_TOKEN
 # - TELEGRAM_WEBHOOK_SECRET
+# - RUNNER_SECRET
 # - GITHUB_TOKEN
+# - ALLOWED_USER_IDS

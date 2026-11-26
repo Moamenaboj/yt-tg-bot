@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -635,7 +636,14 @@ class FastUploader:
             )
 
         try:
-            if not self.senders:
+            async with self._start_lock:
+                self.senders = [
+                    s
+                    for s in self.senders
+                    if not hasattr(s, "is_connected") or s.is_connected()
+                ]
+            if len(self.senders) < max(2, self.connections // 2):
+                await self.close()
                 await self.start()
             if not self.senders:
                 raise RuntimeError("No parallel senders available")
@@ -1250,41 +1258,52 @@ async def run_playlist_pipeline(
     await status.update("\n".join(lines), force=True)
 
 
-async def main() -> int:
-    bot_token = env_str("TELEGRAM_BOT_TOKEN")
-    api_id = env_int("TELEGRAM_API_ID")
-    api_hash = env_str("TELEGRAM_API_HASH")
-    chat_id = env_int("CHAT_ID")
-    status_msg_id = env_int("STATUS_MSG_ID")
-    video_url = env_str("VIDEO_URL")
-    mode = env_str("MODE", "video").lower()
-    quality = env_str("QUALITY", "720").lower()
-    playlist_items = env_str("PLAYLIST_ITEMS")
-    max_playlist_videos = env_int("MAX_PLAYLIST_VIDEOS", 100)
-    upload_connections = env_int("UPLOAD_CONNECTIONS", 12)
-    download_concurrency = env_int("DOWNLOAD_CONCURRENCY", 3)
-    upload_concurrency = env_int("UPLOAD_CONCURRENCY", 2)
-    raw_cookies = os.environ.get("YOUTUBE_COOKIES", "")
+def worker_api_post_sync(
+    worker_url: str, runner_secret: str, path: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    url = worker_url.rstrip("/") + path
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "yt-tg-bot-runner/2.0",
+            "X-Runner-Secret": runner_secret,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        return json.loads(raw) if raw else {}
 
-    if not all([bot_token, api_id, api_hash, chat_id, video_url]):
-        print(
-            "Missing required environment variables: "
-            "TELEGRAM_BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, CHAT_ID, VIDEO_URL",
-            file=sys.stderr,
-        )
-        return 1
 
+async def worker_api_post(
+    worker_url: str, runner_secret: str, path: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        worker_api_post_sync, worker_url, runner_secret, path, payload
+    )
+
+
+async def process_job(
+    client: TelegramClient,
+    fast_uploader: FastUploader,
+    chat_id: int,
+    status_msg_id: int,
+    video_url: str,
+    mode: str,
+    quality: str,
+    playlist_items: str,
+    max_playlist_videos: int,
+    download_concurrency: int,
+    upload_concurrency: int,
+    cookies_path: Optional[Path],
+) -> None:
     if quality not in VALID_QUALITIES:
         quality = "720"
 
-    cookies_path = prepare_cookies_file(raw_cookies)
-    client = TelegramClient(MemorySession(), api_id, api_hash)
-    fast_uploader = FastUploader(client, connections=upload_connections)
-
+    status = StatusTracker(client, chat_id, status_msg_id)
     try:
-        await client.start(bot_token=bot_token)
-        status = StatusTracker(client, chat_id, status_msg_id)
-
         if mode == "playlist":
             await status.update(
                 "🔍 جاري فحص البلايليست واستخراج قائمة الفيديوهات...", force=True
@@ -1300,7 +1319,7 @@ async def main() -> int:
                 await status.update(
                     "⚠️ لم يتم العثور على أي فيديوهات متاحة في البلايليست.", force=True
                 )
-                return 0
+                return
         else:
             playlist_title = ""
             items = [{"url": video_url, "title": ""}]
@@ -1331,17 +1350,221 @@ async def main() -> int:
                 download_concurrency=download_concurrency,
                 upload_concurrency=upload_concurrency,
             )
+    except Exception as exc:
+        print(f"[error] job ({video_url}): {exc}", file=sys.stderr)
+        await status.update(f"❌ حدث خطأ أثناء المعالجة:\n{short_error(exc)}", force=True)
 
+
+async def run_queue_worker(
+    client: TelegramClient,
+    fast_uploader: FastUploader,
+    worker_url: str,
+    runner_secret: str,
+    runner_id: str,
+    warm_idle_sec: int,
+    max_playlist_videos: int,
+    download_concurrency: int,
+    upload_concurrency: int,
+    cookies_path: Optional[Path],
+) -> None:
+    max_runner_sec = 19800  # 5.5 hours (safely under GitHub Actions 6h hard limit)
+    runner_started = time.monotonic()
+    idle_since = time.monotonic()
+    stop_heartbeat = asyncio.Event()
+
+    # Pre-warm parallel MTProto upload connections once for the whole session
+    await fast_uploader.start()
+
+    async def heartbeat_loop() -> None:
+        while not stop_heartbeat.is_set():
+            try:
+                await worker_api_post(
+                    worker_url, runner_secret, "/runner/heartbeat", {"runner_id": runner_id}
+                )
+            except Exception as exc:
+                print(f"[warn] heartbeat failed: {exc}", file=sys.stderr)
+            try:
+                await asyncio.wait_for(stop_heartbeat.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pass
+
+    hb_task = asyncio.create_task(heartbeat_loop())
+    clean_bye_sent = False
+
+    try:
+        while True:
+            try:
+                resp = await worker_api_post(
+                    worker_url, runner_secret, "/runner/claim", {"runner_id": runner_id}
+                )
+            except Exception as exc:
+                print(f"[warn] claim failed: {exc}", file=sys.stderr)
+                await asyncio.sleep(2.0)
+                if (time.monotonic() - idle_since) >= warm_idle_sec:
+                    break
+                continue
+
+            job = resp.get("job")
+            stop_req = bool(resp.get("stop"))
+
+            if job:
+                job_id = int(job["id"])
+                print(
+                    f"[queue] claimed job #{job_id}: mode={job.get('mode')} quality={job.get('quality')}"
+                )
+                try:
+                    await process_job(
+                        client=client,
+                        fast_uploader=fast_uploader,
+                        chat_id=int(job["chat_id"]),
+                        status_msg_id=int(job.get("status_msg_id") or 0),
+                        video_url=str(job["url"]),
+                        mode=str(job.get("mode") or "video").lower(),
+                        quality=str(job.get("quality") or "720").lower(),
+                        playlist_items=str(job.get("playlist_items") or ""),
+                        max_playlist_videos=max_playlist_videos,
+                        download_concurrency=download_concurrency,
+                        upload_concurrency=upload_concurrency,
+                        cookies_path=cookies_path,
+                    )
+                finally:
+                    try:
+                        await worker_api_post(
+                            worker_url,
+                            runner_secret,
+                            "/runner/complete",
+                            {"job_id": job_id, "runner_id": runner_id},
+                        )
+                    except Exception as exc:
+                        print(f"[warn] complete failed for #{job_id}: {exc}", file=sys.stderr)
+                idle_since = time.monotonic()
+                continue
+
+            # No pending job right now
+            elapsed = time.monotonic() - runner_started
+            idle_elapsed = time.monotonic() - idle_since
+            over_max = elapsed >= max_runner_sec
+            if stop_req or over_max or idle_elapsed >= warm_idle_sec:
+                try:
+                    bye = await worker_api_post(
+                        worker_url,
+                        runner_secret,
+                        "/runner/bye",
+                        {"runner_id": runner_id, "force": over_max},
+                    )
+                    if bye.get("ok"):
+                        clean_bye_sent = True
+                        print(
+                            f"[queue] exiting warm session cleanly (idle={idle_elapsed:.0f}s, stop={stop_req})."
+                        )
+                        break
+                    # A job arrived right as we checked; stay alive and claim it immediately!
+                    idle_since = time.monotonic()
+                    continue
+                except Exception as exc:
+                    print(f"[warn] bye failed: {exc}", file=sys.stderr)
+                    break
+
+            await asyncio.sleep(1.5)
+    finally:
+        stop_heartbeat.set()
+        hb_task.cancel()
+        try:
+            await hb_task
+        except BaseException:
+            pass
+        if not clean_bye_sent:
+            try:
+                await worker_api_post(
+                    worker_url,
+                    runner_secret,
+                    "/runner/bye",
+                    {"runner_id": runner_id, "force": True},
+                )
+            except Exception:
+                pass
+
+
+async def main() -> int:
+    bot_token = env_str("TELEGRAM_BOT_TOKEN")
+    api_id = env_int("TELEGRAM_API_ID")
+    api_hash = env_str("TELEGRAM_API_HASH")
+    chat_id = env_int("CHAT_ID")
+    status_msg_id = env_int("STATUS_MSG_ID")
+    video_url = env_str("VIDEO_URL")
+    mode = env_str("MODE", "queue").lower()
+    quality = env_str("QUALITY", "720").lower()
+    playlist_items = env_str("PLAYLIST_ITEMS")
+    max_playlist_videos = env_int("MAX_PLAYLIST_VIDEOS", 100)
+    upload_connections = env_int("UPLOAD_CONNECTIONS", 12)
+    download_concurrency = env_int("DOWNLOAD_CONCURRENCY", 3)
+    upload_concurrency = env_int("UPLOAD_CONCURRENCY", 2)
+    worker_url = env_str("WORKER_URL")
+    runner_secret = env_str("RUNNER_SECRET")
+    runner_id = env_str("RUNNER_ID", "local")
+    warm_idle_sec = env_int("WARM_IDLE_SECONDS", 240)
+    raw_cookies = os.environ.get("YOUTUBE_COOKIES", "")
+
+    if not all([bot_token, api_id, api_hash]):
+        print(
+            "Missing required Telegram secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH",
+            file=sys.stderr,
+        )
+        return 1
+
+    use_queue = (mode == "queue" or not video_url) and bool(worker_url and runner_secret)
+    if not use_queue and not all([chat_id, video_url]):
+        print(
+            "Missing required inputs: either (WORKER_URL + RUNNER_SECRET) for queue mode, or (CHAT_ID + VIDEO_URL).",
+            file=sys.stderr,
+        )
+        return 1
+
+    cookies_path = prepare_cookies_file(raw_cookies)
+    client = TelegramClient(MemorySession(), api_id, api_hash)
+    fast_uploader = FastUploader(client, connections=upload_connections)
+
+    try:
+        await client.start(bot_token=bot_token)
+        if use_queue:
+            await run_queue_worker(
+                client=client,
+                fast_uploader=fast_uploader,
+                worker_url=worker_url,
+                runner_secret=runner_secret,
+                runner_id=runner_id,
+                warm_idle_sec=warm_idle_sec,
+                max_playlist_videos=max_playlist_videos,
+                download_concurrency=download_concurrency,
+                upload_concurrency=upload_concurrency,
+                cookies_path=cookies_path,
+            )
+        else:
+            await process_job(
+                client=client,
+                fast_uploader=fast_uploader,
+                chat_id=chat_id,
+                status_msg_id=status_msg_id,
+                video_url=video_url,
+                mode=mode,
+                quality=quality,
+                playlist_items=playlist_items,
+                max_playlist_videos=max_playlist_videos,
+                download_concurrency=download_concurrency,
+                upload_concurrency=upload_concurrency,
+                cookies_path=cookies_path,
+            )
         return 0
     except Exception as exc:
         print(f"[fatal] {exc}", file=sys.stderr)
-        try:
-            await client.send_message(
-                chat_id,
-                f"❌ حدث خطأ أثناء المعالجة:\n{short_error(exc)}",
-            )
-        except Exception:
-            pass
+        if chat_id:
+            try:
+                await client.send_message(
+                    chat_id,
+                    f"❌ حدث خطأ أثناء المعالجة:\n{short_error(exc)}",
+                )
+            except Exception:
+                pass
         return 1
     finally:
         await fast_uploader.close()
