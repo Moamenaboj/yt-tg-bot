@@ -258,12 +258,12 @@ def build_base_ydl_opts(cookies_path: Optional[Path]) -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "retries": 5,
-        "fragment_retries": 5,
+        "retries": 2,
+        "fragment_retries": 2,
         "file_access_retries": 3,
         "concurrent_fragment_downloads": 8,
         "http_chunk_size": 10 * 1024 * 1024,
-        "socket_timeout": 30,
+        "socket_timeout": 15,
         "source_address": "0.0.0.0",
         "js_runtimes": {"deno": {}},
         "remote_components": ["ejs:github"],
@@ -340,7 +340,31 @@ def extract_playlist_entries(
 _INVIDIOUS_CACHE: tuple[float, list[str]] = (0.0, [])
 _INVIDIOUS_LOCK = threading.Lock()
 _PREFERRED_STRATEGY: Optional[str] = None
+_BGUTIL_WAITED = False
+_BGUTIL_LOCK = threading.Lock()
 _BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+
+def wait_for_bgutil_once(timeout: float = 18.0) -> bool:
+    """Ensures background bgutil PO-token server is ready before first yt-dlp call."""
+    global _BGUTIL_WAITED
+    with _BGUTIL_LOCK:
+        if _BGUTIL_WAITED:
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:4416/ping", timeout=1.5) as r:
+                    if r.status == 200:
+                        _BGUTIL_WAITED = True
+                        print("[info] bgutil PO Token provider confirmed ready.")
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        _BGUTIL_WAITED = True
+        print("[warn] bgutil PO Token provider not reachable within timeout; continuing.", file=sys.stderr)
+        return False
 
 
 def get_active_warp_proxy() -> Optional[str]:
@@ -682,34 +706,32 @@ def download_via_invidious_sync(
         f_v.result()
         f_a.result()
 
-    out_mp4 = work_dir / f"{vid}.mp4"
     is_audio_mp4 = "mp4" in str(best_audio.get("type") or "").lower()
     is_video_mp4 = "mp4" in str(best_video.get("type") or "").lower()
-    v_codec = "copy" if is_video_mp4 else "libx264"
-    a_codec = "copy" if is_audio_mp4 else "aac"
+    out_ext = "mp4" if is_video_mp4 else "mkv"
+    out_media = work_dir / f"{vid}.{out_ext}"
+    a_codec = "copy" if (is_audio_mp4 or not is_video_mp4) else "aac"
 
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(video_raw),
-            "-i",
-            str(audio_raw),
-            "-c:v",
-            v_codec,
-            "-c:a",
-            a_codec,
-            "-movflags",
-            "+faststart",
-            str(out_mp4),
-        ],
-        check=True,
-        capture_output=True,
-    )
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_raw),
+        "-i",
+        str(audio_raw),
+        "-c:v",
+        "copy",
+        "-c:a",
+        a_codec,
+    ]
+    if out_ext == "mp4":
+        ffmpeg_cmd.extend(["-movflags", "+faststart"])
+    ffmpeg_cmd.append(str(out_media))
+
+    subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
     video_raw.unlink(missing_ok=True)
     audio_raw.unlink(missing_ok=True)
-    return out_mp4, {"title": title, "uploader": uploader, "duration": duration}
+    return out_media, {"title": title, "uploader": uploader, "duration": duration}
 
 
 def download_single_sync(
@@ -720,6 +742,7 @@ def download_single_sync(
     on_progress: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> tuple[Path, dict[str, Any]]:
     global _PREFERRED_STRATEGY
+    wait_for_bgutil_once(timeout=18.0)
     warp_proxy = get_active_warp_proxy()
     has_cookies = bool(cookies_path and cookies_path.exists())
 
@@ -727,10 +750,10 @@ def download_single_sync(
     strategies: list[tuple[str, Optional[Path], Optional[list[str]], Optional[str]]] = []
     if warp_proxy:
         strategies.append(("warp_nocookie", None, None, warp_proxy))
-        strategies.append(("warp_tv_mweb", None, ["tv", "mweb", "android_vr"], warp_proxy))
+        strategies.append(("warp_tv_mweb", None, ["mweb", "tv"], warp_proxy))
     if has_cookies:
         strategies.append(("cookies_default", cookies_path, None, warp_proxy))
-    strategies.append(("direct_nocookie", None, ["tv", "mweb", "android_vr"], None))
+    strategies.append(("direct_nocookie", None, ["mweb", "tv"], None))
     strategies.append(("invidious", None, None, None))
 
     # Promote whatever strategy already worked in this session to avoid wasted retries!
@@ -1190,9 +1213,10 @@ class FastUploader:
                         if is_big
                         else SaveFilePartRequest(file_id, part_index, data)
                     )
-                    for attempt in range(4):
+                    cur_sender = sender
+                    for attempt in range(5):
                         try:
-                            ok = await sender.send(req)
+                            ok = await asyncio.wait_for(cur_sender.send(req), timeout=35.0)
                             if ok:
                                 break
                             raise RuntimeError(
@@ -1201,9 +1225,17 @@ class FastUploader:
                         except FloodWaitError as exc:
                             await asyncio.sleep(exc.seconds + 1)
                         except Exception:
-                            if attempt == 3:
+                            if attempt == 4:
                                 raise
-                            await asyncio.sleep(1 + attempt)
+                            healthy = [
+                                s
+                                for s in senders
+                                if s is not cur_sender
+                                and (not hasattr(s, "is_connected") or s.is_connected())
+                            ]
+                            if healthy:
+                                cur_sender = healthy[(part_index + attempt) % len(healthy)]
+                            await asyncio.sleep(0.5 + attempt)
 
                     async with progress_lock:
                         uploaded_bytes += len(data)
