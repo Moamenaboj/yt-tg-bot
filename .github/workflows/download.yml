@@ -70,16 +70,18 @@ jobs:
         with:
           deno-version: "v2.x"
 
-      - name: Restore cached media & proxy tools
-        id: tools-cache
+      - name: Restore cached media & WARP tools
         uses: actions/cache@v4
         with:
-          path: ~/.local/ffmpeg-bin
-          key: ytdlp-tools-linux64-v2
+          path: |
+            ~/.local/ffmpeg-bin
+            ~/.local/warp-profile
+          key: ytdlp-tools-warp-linux64-v3
 
-      - name: Install static ffmpeg, wgcf, wireproxy (cache miss only)
+      - name: Prepare static ffmpeg, wgcf, wireproxy & start WARP proxy
+        continue-on-error: true
         run: |
-          mkdir -p "$HOME/.local/ffmpeg-bin"
+          mkdir -p "$HOME/.local/ffmpeg-bin" "$HOME/.local/warp-profile"
           if [ ! -x "$HOME/.local/ffmpeg-bin/ffmpeg" ] || [ ! -x "$HOME/.local/ffmpeg-bin/ffprobe" ]; then
             curl -fsSL "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
               -o /tmp/ffmpeg.tar.xz
@@ -103,18 +105,15 @@ jobs:
             rm -f /tmp/wireproxy.tar.gz
           fi
           echo "$HOME/.local/ffmpeg-bin" >> "$GITHUB_PATH"
-          "$HOME/.local/ffmpeg-bin/ffmpeg" -version | head -n 1
 
-      - name: Start Cloudflare WARP HTTP proxy (no cookies needed)
-        continue-on-error: true
-        run: |
-          mkdir -p /tmp/warp
-          cd /tmp/warp
-          "$HOME/.local/ffmpeg-bin/wgcf" register --accept-tos >/tmp/warp.log 2>&1 || true
-          "$HOME/.local/ffmpeg-bin/wgcf" generate >>/tmp/warp.log 2>&1
-          python3 - <<'PY'
-          import pathlib
-          raw = pathlib.Path("/tmp/warp/wgcf-profile.conf").read_text()
+          if [ ! -s "$HOME/.local/warp-profile/proxy.conf" ]; then
+            cd "$HOME/.local/warp-profile"
+            "$HOME/.local/ffmpeg-bin/wgcf" register --accept-tos >/tmp/warp.log 2>&1 || true
+            "$HOME/.local/ffmpeg-bin/wgcf" generate >>/tmp/warp.log 2>&1
+            python3 - <<'PY'
+          import os, pathlib
+          p = pathlib.Path(os.path.expanduser("~/.local/warp-profile"))
+          raw = (p / "wgcf-profile.conf").read_text()
           priv = pub = ep = ""
           addrs = []
           for line in raw.splitlines():
@@ -125,34 +124,23 @@ jobs:
               elif line.startswith("Address"):
                   for a in line.split("=", 1)[1].split(","):
                       a = a.strip()
-                      if a and "." in a:  # IPv4 address only for clean IPv4 routing
+                      if a and "." in a:
                           addrs.append(a)
           addr = addrs[0] if addrs else "172.16.0.2/32"
-          cfg = f"""[Interface]
-          PrivateKey = {priv}
-          Address = {addr}
-          DNS = 1.1.1.1
-
-          [Peer]
-          PublicKey = {pub}
-          Endpoint = {ep}
-          AllowedIPs = 0.0.0.0/0
-
-          [http]
-          BindAddress = 127.0.0.1:8118
-          """
-          pathlib.Path("/tmp/warp/proxy.conf").write_text("\n".join(l.strip() for l in cfg.splitlines()) + "\n")
+          cfg = f"[Interface]\nPrivateKey = {priv}\nAddress = {addr}\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = {pub}\nEndpoint = {ep}\nAllowedIPs = 0.0.0.0/0\n\n[http]\nBindAddress = 127.0.0.1:8118\n"
+          (p / "proxy.conf").write_text(cfg)
           PY
-          nohup "$HOME/.local/ffmpeg-bin/wireproxy" -c /tmp/warp/proxy.conf >/tmp/wireproxy.log 2>&1 &
-          for i in $(seq 1 8); do
-            if curl -sf --max-time 3 -x http://127.0.0.1:8118 https://www.cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
-              echo "Cloudflare WARP proxy is ready (warp=on)."
+          fi
+
+          nohup "$HOME/.local/ffmpeg-bin/wireproxy" -c "$HOME/.local/warp-profile/proxy.conf" >/tmp/wireproxy.log 2>&1 &
+          for i in $(seq 1 5); do
+            if curl -sf --max-time 2 -x http://127.0.0.1:8118 https://www.cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+              echo "Cloudflare WARP proxy ready (warp=on)."
               exit 0
             fi
             sleep 1
           done
-          echo "WARP proxy check inconclusive; continuing anyway."
-          cat /tmp/wireproxy.log 2>/dev/null || true
+          echo "WARP starting in background; continuing."
 
       - name: Install Python dependencies (uv)
         run: |
@@ -161,19 +149,6 @@ jobs:
           fi
           uv pip install --python .venv/bin/python --upgrade-package yt-dlp -r requirements.txt
 
-      - name: Wait briefly for bgutil PO Token provider
-        continue-on-error: true
-        run: |
-          for i in $(seq 1 12); do
-            if curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1; then
-              echo "bgutil PO Token provider is ready."
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "bgutil PO Token provider not ready yet; continuing."
-          cat /tmp/bgutil.log 2>/dev/null || true
-
       - name: Download and upload to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -181,10 +156,10 @@ jobs:
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
           RUNNER_SECRET: ${{ secrets.RUNNER_SECRET }}
-          WORKER_URL: "https://yt-tg-bot.momenabojbarh.workers.dev"
+          WORKER_URL: ${{ secrets.WORKER_URL }}
           WARP_PROXY: "http://127.0.0.1:8118"
           RUNNER_ID: ${{ github.run_id }}
-          WARM_IDLE_SECONDS: "240"
+          WARM_IDLE_SECONDS: "300"
           CHAT_ID: ${{ inputs.chat_id }}
           STATUS_MSG_ID: ${{ inputs.status_msg_id }}
           VIDEO_URL: ${{ inputs.url }}
@@ -193,7 +168,7 @@ jobs:
           PLAYLIST_ITEMS: ${{ inputs.playlist_items }}
           MAX_PLAYLIST_VIDEOS: "100"
           UPLOAD_CONNECTIONS: "12"
-          DOWNLOAD_CONCURRENCY: "2"
+          DOWNLOAD_CONCURRENCY: "3"
           UPLOAD_CONCURRENCY: "2"
         run: .venv/bin/python scripts/downloader.py
 

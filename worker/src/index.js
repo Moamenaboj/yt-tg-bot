@@ -23,7 +23,7 @@ const QUALITY_LABELS = {
   "720": "720p",
   "480": "480p",
   "360": "360p",
-  mp3: "MP3 (صوت)",
+  mp3: "صوت (M4A سريع)",
 };
 
 const HEARTBEAT_ALIVE_SEC = 28;
@@ -269,7 +269,7 @@ function buildKeyboard(info) {
           { text: "📋 360p", callback_data: "dl:p:360" },
         ],
         [
-          { text: "🎵 صوت MP3", callback_data: "dl:p:mp3" },
+          { text: "🎵 صوت (سريع)", callback_data: "dl:p:mp3" },
           { text: "❌ إلغاء", callback_data: "cancel" },
         ],
       ],
@@ -285,7 +285,7 @@ function buildKeyboard(info) {
         ],
         [
           { text: "🎬 هذا الفيديو 360p", callback_data: "dl:v:360" },
-          { text: "🎵 هذا الفيديو MP3", callback_data: "dl:v:mp3" },
+          { text: "🎵 هذا الفيديو (صوت)", callback_data: "dl:v:mp3" },
         ],
         [
           { text: "📋 البلايليست كاملة 720p", callback_data: "dl:p:720" },
@@ -293,7 +293,7 @@ function buildKeyboard(info) {
         ],
         [
           { text: "📋 البلايليست كاملة 360p", callback_data: "dl:p:360" },
-          { text: "🎵 البلايليست MP3", callback_data: "dl:p:mp3" },
+          { text: "🎵 البلايليست (صوت)", callback_data: "dl:p:mp3" },
         ],
         [{ text: "❌ إلغاء", callback_data: "cancel" }],
       ],
@@ -311,7 +311,7 @@ function buildKeyboard(info) {
         { text: "🎬 360p", callback_data: "dl:v:360" },
       ],
       [
-        { text: "🎵 صوت MP3", callback_data: "dl:v:mp3" },
+        { text: "🎵 صوت (سريع)", callback_data: "dl:v:mp3" },
         { text: "❌ إلغاء", callback_data: "cancel" },
       ],
     ],
@@ -363,7 +363,7 @@ async function handleMessage(msg, env) {
       } else if (isBooting) {
         statusText = `🟡 السيرفر قيد التشغيل الآن...\n📦 بالانتظار: ${pending}`;
       } else {
-        statusText = `⚪ السيرفر في وضع السكون (يوفّر دقائقك)\n⏱️ أول طلب سيستغرق ~10 ثوانٍ، ثم يبقى جاهزاً لـ 4 دقائق.`;
+        statusText = `⚪ السيرفر في وضع السكون\n⏱️ أول طلب سيستغرق ~12 ثانية، ثم يبقى جاهزاً لـ 5 دقائق.`;
       }
     }
     await tgApi(env.TELEGRAM_BOT_TOKEN, "sendMessage", {
@@ -396,7 +396,7 @@ async function handleMessage(msg, env) {
         "• لتحميل جزء محدد من بلايليست، أضف النطاق بعد الرابط:",
         "  https://youtube.com/playlist?list=... 1-10",
         "",
-        "⚡ وضع الجلسة الساخنة مفعّل: أول طلب ~10 ثوانٍ، وأي طلب خلال 4 دقائق يبدأ خلال ~1 ثانية!",
+        "⚡ وضع الجلسة الساخنة مفعّل: أول طلب ~12 ثانية، وأي طلب خلال 5 دقائق يبدأ خلال ~1 ثانية!",
         "• /status — عرض حالة السيرفر",
         "• /sleep — إيقاف السيرفر الساخن فوراً لتوفير الدقائق",
       ].join("\n"),
@@ -559,7 +559,7 @@ async function handleCallbackQuery(cq, env) {
       statusLines.push(`📌 النطاق: ${effectiveItems}`);
     }
     if (!isAlive && !isBooting) {
-      statusLines.push("⚡ سيبقى السيرفر ساخناً لـ 4 دقائق لتنفيذ طلباتك التالية خلال ~1 ثانية.");
+      statusLines.push("⚡ سيبقى السيرفر ساخناً لـ 5 دقائق لتنفيذ طلباتك التالية خلال ~1 ثانية.");
     }
 
     await tgApi(env.TELEGRAM_BOT_TOKEN, "editMessageText", {
@@ -571,12 +571,13 @@ async function handleCallbackQuery(cq, env) {
 
     if (!isAlive && !isBooting) {
       await env.DB.prepare("UPDATE runner_state SET last_dispatch = ? WHERE id = 1").bind(ts).run();
+      // Keep dispatch inputs free of personal URLs / Chat IDs (job details travel privately over D1)
       const ghRes = await dispatchGitHubWorkflow(env, {
         mode: "queue",
-        chat_id: String(chatId),
-        status_msg_id: String(messageId),
+        chat_id: "",
+        status_msg_id: "0",
         url: "",
-        quality,
+        quality: "720",
         playlist_items: "",
       });
       if (!ghRes.ok) {
