@@ -339,42 +339,73 @@ def download_single_sync(
     cookies_path: Optional[Path],
     on_progress: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> tuple[Path, dict[str, Any]]:
-    opts = build_base_ydl_opts(cookies_path)
-    opts.update(
-        {
-            "noplaylist": True,
-            "outtmpl": str(work_dir / "%(id)s.%(ext)s"),
-            "writethumbnail": True,
-            "overwrites": True,
-        }
-    )
-    if on_progress:
-        opts["progress_hooks"] = [on_progress]
+    has_cookies = bool(cookies_path and cookies_path.exists())
+    strategies: list[tuple[str, Optional[Path], Optional[list[str]]]] = [
+        ("default", cookies_path if has_cookies else None, None),
+        ("tv_mweb_safari", cookies_path if has_cookies else None, ["tv", "mweb", "web_safari"]),
+    ]
+    if has_cookies:
+        # Fallback without cookies in case YouTube soft-flagged/rotated the cookie session
+        strategies.append(("nocookie_mweb_tv", None, ["mweb", "tv", "android_vr"]))
 
-    if quality == "mp3":
-        opts["format"] = "bestaudio/best"
-        opts["postprocessors"] = [
+    info: Optional[dict[str, Any]] = None
+    last_exc: Optional[Exception] = None
+
+    for strat_name, strat_cookies, player_clients in strategies:
+        opts = build_base_ydl_opts(strat_cookies)
+        opts.update(
             {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
+                "noplaylist": True,
+                "outtmpl": str(work_dir / "%(id)s.%(ext)s"),
+                "writethumbnail": True,
+                "overwrites": True,
             }
-        ]
-    else:
-        q = int(quality)
-        opts["format"] = (
-            f"bestvideo[height<={q}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-            f"bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"bestvideo[height<={q}]+bestaudio/"
-            f"best[height<={q}]/best"
         )
-        opts["merge_output_format"] = "mp4"
-        opts["postprocessor_args"] = {"merger": ["-movflags", "+faststart"]}
+        if player_clients:
+            opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+        if on_progress:
+            opts["progress_hooks"] = [on_progress]
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+        if quality == "mp3":
+            opts["format"] = "bestaudio/best"
+            opts["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ]
+        else:
+            q = int(quality)
+            opts["format"] = (
+                f"bestvideo[height<={q}][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+                f"bestvideo[height<={q}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={q}]+bestaudio/"
+                f"best[height<={q}]/best"
+            )
+            opts["merge_output_format"] = "mp4"
+            opts["postprocessor_args"] = {"merger": ["-movflags", "+faststart"]}
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            if info:
+                if strat_name != "default":
+                    print(f"[info] downloaded via fallback strategy '{strat_name}': {url}")
+                break
+        except Exception as exc:
+            last_exc = exc
+            if is_bot_block_error(exc) and strat_name != strategies[-1][0]:
+                print(
+                    f"[warn] strategy '{strat_name}' hit YouTube restriction ({short_error(exc)}); trying next fallback...",
+                    file=sys.stderr,
+                )
+                continue
+            raise
 
     if not info:
+        if last_exc:
+            raise last_exc
         raise RuntimeError("فشل استخراج بيانات الفيديو.")
 
     media_path: Optional[Path] = None
@@ -845,13 +876,17 @@ async def deliver_uploaded_media(
 
 
 def is_bot_block_error(exc: Exception) -> bool:
-    low = str(exc).lower()
-    return "not a bot" in low or "sign in to confirm" in low
+    low = str(exc).lower().replace("\u2019", "'")
+    return (
+        "not a bot" in low
+        or "sign in to confirm" in low
+        or "this content isn't available" in low
+    )
 
 
 def short_error(exc: Exception) -> str:
     if is_bot_block_error(exc):
-        return "يوتيوب طلب التحقق (أضف أو حدّث YOUTUBE_COOKIES في GitHub Secrets)."
+        return "يوتيوب قيّد جلسة الكوكيز الحالية (حدّث YOUTUBE_COOKIES في GitHub Secrets)."
     msg = str(exc).strip().splitlines()
     text = msg[-1] if msg else exc.__class__.__name__
     return truncate_text(text, 180)

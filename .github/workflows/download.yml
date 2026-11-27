@@ -53,6 +53,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Launch bgutil PO Token provider in background
+        continue-on-error: true
+        run: |
+          nohup bash -c 'docker run -d --name bgutil-pot --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider:latest >/tmp/bgutil.log 2>&1' >/dev/null 2>&1 &
+
       - name: Set up uv & Python 3.12
         uses: astral-sh/setup-uv@v5
         with:
@@ -87,31 +92,25 @@ jobs:
           echo "$HOME/.local/ffmpeg-bin" >> "$GITHUB_PATH"
           "$HOME/.local/ffmpeg-bin/ffmpeg" -version | head -n 1
 
-      - name: Start bgutil PO Token provider (only if no cookies)
-        continue-on-error: true
-        env:
-          HAS_COOKIES: ${{ secrets.YOUTUBE_COOKIES != '' }}
-        run: |
-          if [ "$HAS_COOKIES" = "true" ]; then
-            echo "YOUTUBE_COOKIES set; skipping bgutil Docker startup."
-            exit 0
-          fi
-          docker run -d --name bgutil-pot --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider:latest
-          for i in $(seq 1 20); do
-            if curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1; then
-              echo "bgutil PO Token provider is ready."
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "bgutil PO Token provider did not respond in time; continuing anyway."
-
       - name: Install Python dependencies (uv)
         run: |
           if [ ! -x .venv/bin/python ]; then
             uv venv --clear .venv --python 3.12
           fi
           uv pip install --python .venv/bin/python --upgrade-package yt-dlp -r requirements.txt
+
+      - name: Wait briefly for bgutil PO Token provider
+        continue-on-error: true
+        run: |
+          for i in $(seq 1 12); do
+            if curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1; then
+              echo "bgutil PO Token provider is ready."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "bgutil PO Token provider not ready yet; continuing."
+          cat /tmp/bgutil.log 2>/dev/null || true
 
       - name: Download and upload to Telegram
         env:
@@ -131,7 +130,7 @@ jobs:
           PLAYLIST_ITEMS: ${{ inputs.playlist_items }}
           MAX_PLAYLIST_VIDEOS: "100"
           UPLOAD_CONNECTIONS: "12"
-          DOWNLOAD_CONCURRENCY: "3"
+          DOWNLOAD_CONCURRENCY: "2"
           UPLOAD_CONCURRENCY: "2"
         run: .venv/bin/python scripts/downloader.py
 
