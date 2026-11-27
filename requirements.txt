@@ -3,3 +3,4 @@ bgutil-ytdlp-pot-provider
 telethon>=1.36.0
 cryptg
 pillow
+pysocks

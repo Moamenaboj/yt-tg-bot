@@ -12,6 +12,7 @@ Features:
 
 import asyncio
 import base64
+import concurrent.futures
 from dataclasses import dataclass
 import hashlib
 import json
@@ -19,10 +20,13 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -332,6 +336,389 @@ def extract_playlist_entries(
     return playlist_title, items, was_capped
 
 
+_INVIDIOUS_CACHE: tuple[float, list[str]] = (0.0, [])
+_INVIDIOUS_LOCK = threading.Lock()
+_PREFERRED_STRATEGY: Optional[str] = None
+_BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+
+def get_active_warp_proxy() -> Optional[str]:
+    proxy_url = env_str("WARP_PROXY")
+    if not proxy_url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(proxy_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 8118
+        with socket.create_connection((host, port), timeout=1.0):
+            return proxy_url
+    except OSError:
+        return None
+
+
+def extract_youtube_id(url: str) -> Optional[str]:
+    patterns = [
+        r"(?:v=|/v/|/embed/|/shorts/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def discover_invidious_hosts() -> list[str]:
+    global _INVIDIOUS_CACHE
+    now = time.monotonic()
+    with _INVIDIOUS_LOCK:
+        if _INVIDIOUS_CACHE[1] and (now - _INVIDIOUS_CACHE[0]) < 1800:
+            return list(_INVIDIOUS_CACHE[1])
+
+    fallback_seeds = [
+        "https://yt.chocolatemoo53.com",
+        "https://invidious.nerdvpn.de",
+        "https://inv.nadeko.net",
+        "https://invidious.tiekoetter.com",
+    ]
+    hosts: list[str] = []
+    try:
+        req = urllib.request.Request(
+            "https://api.invidious.io/instances.json?sort_by=health",
+            headers={"User-Agent": _BROWSER_UA},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        for entry in data:
+            if not isinstance(entry, list) or len(entry) < 2 or not isinstance(entry[1], dict):
+                continue
+            meta = entry[1]
+            if meta.get("type") == "https" and meta.get("api") and meta.get("uri"):
+                uri = str(meta["uri"]).rstrip("/")
+                if uri not in hosts:
+                    hosts.append(uri)
+    except Exception as exc:
+        print(f"[warn] invidious registry fetch failed: {exc}", file=sys.stderr)
+
+    for seed in fallback_seeds:
+        if seed not in hosts:
+            hosts.append(seed)
+
+    with _INVIDIOUS_LOCK:
+        _INVIDIOUS_CACHE = (now, hosts)
+    return list(hosts)
+
+
+def _download_http_stream_parallel(
+    stream_url: str,
+    out_path: Path,
+    expected_size: int = 0,
+    on_bytes: Optional[Callable[[int, int], None]] = None,
+    workers: int = 6,
+) -> int:
+    """Downloads an HTTP stream via parallel Range chunks (with sequential fallback)."""
+    total_size = expected_size
+    supports_range = False
+
+    # Probe exact content-length & Range support via a 1-byte range GET
+    try:
+        probe_req = urllib.request.Request(
+            stream_url,
+            headers={"User-Agent": _BROWSER_UA, "Range": "bytes=0-0"},
+        )
+        with urllib.request.urlopen(probe_req, timeout=20) as resp:
+            if resp.status == 206:
+                supports_range = True
+                cr = resp.headers.get("Content-Range", "")
+                if "/" in cr:
+                    sz = cr.rsplit("/", 1)[-1].strip()
+                    if sz.isdigit():
+                        total_size = int(sz)
+            else:
+                cl = resp.headers.get("Content-Length", "")
+                if cl.isdigit():
+                    total_size = int(cl)
+    except Exception:
+        supports_range = False
+
+    if supports_range and total_size >= 2 * 1024 * 1024:
+        chunk_size = 2 * 1024 * 1024  # 2 MiB chunks
+        ranges = [
+            (start, min(start + chunk_size - 1, total_size - 1))
+            for start in range(0, total_size, chunk_size)
+        ]
+        # Pre-allocate output file
+        with open(out_path, "wb") as f:
+            f.truncate(total_size)
+
+        downloaded = 0
+        dl_lock = threading.Lock()
+        write_lock = threading.Lock()
+
+        def fetch_one(byte_range: tuple[int, int]) -> None:
+            nonlocal downloaded
+            start, end = byte_range
+            last_err: Optional[Exception] = None
+            for attempt in range(4):
+                try:
+                    req = urllib.request.Request(
+                        stream_url,
+                        headers={
+                            "User-Agent": _BROWSER_UA,
+                            "Range": f"bytes={start}-{end}",
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        data = resp.read()
+                    if not data:
+                        raise RuntimeError("Empty chunk")
+                    with write_lock:
+                        with open(out_path, "r+b") as wf:
+                            wf.seek(start)
+                            wf.write(data)
+                    with dl_lock:
+                        downloaded += len(data)
+                        cur = downloaded
+                    if on_bytes:
+                        on_bytes(cur, total_size)
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    time.sleep(1 + attempt)
+            if last_err:
+                raise last_err
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(fetch_one, r) for r in ranges]
+            for fut in concurrent.futures.as_completed(futs):
+                fut.result()
+        return out_path.stat().st_size
+
+    # Sequential streaming fallback
+    req = urllib.request.Request(stream_url, headers={"User-Agent": _BROWSER_UA})
+    written = 0
+    with urllib.request.urlopen(req, timeout=60) as resp, open(out_path, "wb") as wf:
+        if not total_size:
+            cl = resp.headers.get("Content-Length", "")
+            if cl.isdigit():
+                total_size = int(cl)
+        while True:
+            buf = resp.read(256 * 1024)
+            if not buf:
+                break
+            wf.write(buf)
+            written += len(buf)
+            if on_bytes:
+                on_bytes(written, total_size)
+    return written
+
+
+def download_via_invidious_sync(
+    url: str,
+    quality: str,
+    work_dir: Path,
+    on_progress: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> tuple[Path, dict[str, Any]]:
+    """
+    100% zero-cookie YouTube downloader using live public Invidious API proxies
+    discovered dynamically from api.invidious.io.
+    """
+    vid = extract_youtube_id(url)
+    if not vid:
+        raise RuntimeError("تعذر استخراج معرّف الفيديو من الرابط.")
+
+    hosts = discover_invidious_hosts()
+    meta: Optional[dict[str, Any]] = None
+    active_host: Optional[str] = None
+    last_err: Optional[Exception] = None
+
+    for host in hosts:
+        try:
+            req = urllib.request.Request(
+                f"{host}/api/v1/videos/{vid}",
+                headers={"User-Agent": _BROWSER_UA},
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                cand = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if cand.get("adaptiveFormats") or cand.get("formatStreams"):
+                meta = cand
+                active_host = host
+                break
+        except Exception as exc:
+            last_err = exc
+            print(f"[warn] invidious host {host} failed: {exc}", file=sys.stderr)
+
+    if not meta or not active_host:
+        raise RuntimeError(f"تعذر الوصول إلى خوادم Invidious البديلة: {last_err}")
+
+    title = (meta.get("title") or vid).strip()
+    uploader = (meta.get("author") or "YouTube").strip()
+    duration = int(meta.get("lengthSeconds") or 0)
+    adaptive = meta.get("adaptiveFormats") or []
+
+    # Pick best audio stream (prefer mp4a / itag 140 for lossless copy into mp4)
+    audio_fmts = [f for f in adaptive if str(f.get("type") or "").startswith("audio/")]
+    if not audio_fmts:
+        raise RuntimeError("لم يتم العثور على مسار صوتي عبر Invidious.")
+
+    def audio_score(f: dict[str, Any]) -> tuple[int, int]:
+        typ = str(f.get("type") or "").lower()
+        is_mp4a = 1 if ("mp4" in typ or "mp4a" in typ) else 0
+        bitrate = int(f.get("bitrate") or 0)
+        return (is_mp4a, bitrate)
+
+    audio_fmts.sort(key=audio_score, reverse=True)
+    best_audio = audio_fmts[0]
+    audio_itag = str(best_audio["itag"])
+    audio_size = int(best_audio.get("clen") or 0)
+
+    # Download thumbnail (best effort)
+    thumbs = meta.get("videoThumbnails") or []
+    if thumbs:
+        thumbs_sorted = sorted(thumbs, key=lambda t: int(t.get("width") or 0), reverse=True)
+        for t in thumbs_sorted:
+            t_url = t.get("url") or ""
+            if t_url.startswith("/"):
+                t_url = active_host + t_url
+            if t_url.startswith("http"):
+                try:
+                    t_req = urllib.request.Request(t_url, headers={"User-Agent": _BROWSER_UA})
+                    with urllib.request.urlopen(t_req, timeout=10) as tr:
+                        (work_dir / f"{vid}.jpg").write_bytes(tr.read())
+                    break
+                except Exception:
+                    continue
+
+    start_ts = time.monotonic()
+
+    def report_prog(done_b: int, total_b: int) -> None:
+        if not on_progress:
+            return
+        elapsed = max(0.1, time.monotonic() - start_ts)
+        on_progress(
+            {
+                "status": "downloading",
+                "downloaded_bytes": done_b,
+                "total_bytes": total_b,
+                "speed": done_b / elapsed,
+            }
+        )
+
+    if quality == "mp3":
+        audio_raw = work_dir / f"{vid}_audio.raw"
+        audio_url = f"{active_host}/latest_version?id={vid}&itag={audio_itag}&local=true"
+        _download_http_stream_parallel(audio_url, audio_raw, audio_size, report_prog)
+        out_mp3 = work_dir / f"{vid}.mp3"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(audio_raw),
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                str(out_mp3),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        audio_raw.unlink(missing_ok=True)
+        return out_mp3, {"title": title, "uploader": uploader, "duration": duration}
+
+    target_h = int(quality)
+    video_fmts = [f for f in adaptive if str(f.get("type") or "").startswith("video/")]
+
+    def parse_height(f: dict[str, Any]) -> int:
+        ql = str(f.get("qualityLabel") or "")
+        m = re.match(r"(\d+)p", ql)
+        if m:
+            return int(m.group(1))
+        res = str(f.get("resolution") or "")
+        if "x" in res:
+            parts = res.split("x")
+            if parts[-1].isdigit():
+                return int(parts[-1])
+        return 0
+
+    def video_score(f: dict[str, Any]) -> tuple[int, int, int, int]:
+        h = parse_height(f)
+        typ = str(f.get("type") or "").lower()
+        # Strongly prefer H.264 (avc1) MP4 so Telegram mobile plays natively without issues
+        is_avc = 2 if "avc1" in typ else (1 if "mp4" in typ else 0)
+        within = 1 if (0 < h <= target_h) else 0
+        eff_h = h if within else -h
+        bitrate = int(f.get("bitrate") or 0)
+        return (within, eff_h, is_avc, bitrate)
+
+    if not video_fmts:
+        raise RuntimeError("لم يتم العثور على مسار فيديو عبر Invidious.")
+
+    video_fmts.sort(key=video_score, reverse=True)
+    best_video = video_fmts[0]
+    video_itag = str(best_video["itag"])
+    video_size = int(best_video.get("clen") or 0)
+    combined_total = video_size + audio_size
+
+    video_raw = work_dir / f"{vid}_video.raw"
+    audio_raw = work_dir / f"{vid}_audio.raw"
+    video_url = f"{active_host}/latest_version?id={vid}&itag={video_itag}&local=true"
+    audio_url = f"{active_host}/latest_version?id={vid}&itag={audio_itag}&local=true"
+
+    v_done = [0]
+    a_done = [0]
+    p_lock = threading.Lock()
+
+    def on_v_bytes(cur: int, _tot: int) -> None:
+        with p_lock:
+            v_done[0] = cur
+            tot = combined_total if combined_total > 0 else cur + a_done[0]
+            report_prog(v_done[0] + a_done[0], tot)
+
+    def on_a_bytes(cur: int, _tot: int) -> None:
+        with p_lock:
+            a_done[0] = cur
+            tot = combined_total if combined_total > 0 else v_done[0] + cur
+            report_prog(v_done[0] + a_done[0], tot)
+
+    # Download video & audio simultaneously via Invidious proxy!
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_v = ex.submit(_download_http_stream_parallel, video_url, video_raw, video_size, on_v_bytes, 4)
+        f_a = ex.submit(_download_http_stream_parallel, audio_url, audio_raw, audio_size, on_a_bytes, 4)
+        f_v.result()
+        f_a.result()
+
+    out_mp4 = work_dir / f"{vid}.mp4"
+    is_audio_mp4 = "mp4" in str(best_audio.get("type") or "").lower()
+    is_video_mp4 = "mp4" in str(best_video.get("type") or "").lower()
+    v_codec = "copy" if is_video_mp4 else "libx264"
+    a_codec = "copy" if is_audio_mp4 else "aac"
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_raw),
+            "-i",
+            str(audio_raw),
+            "-c:v",
+            v_codec,
+            "-c:a",
+            a_codec,
+            "-movflags",
+            "+faststart",
+            str(out_mp4),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    video_raw.unlink(missing_ok=True)
+    audio_raw.unlink(missing_ok=True)
+    return out_mp4, {"title": title, "uploader": uploader, "duration": duration}
+
+
 def download_single_sync(
     url: str,
     quality: str,
@@ -339,19 +726,43 @@ def download_single_sync(
     cookies_path: Optional[Path],
     on_progress: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> tuple[Path, dict[str, Any]]:
+    global _PREFERRED_STRATEGY
+    warp_proxy = get_active_warp_proxy()
     has_cookies = bool(cookies_path and cookies_path.exists())
-    strategies: list[tuple[str, Optional[Path], Optional[list[str]]]] = [
-        ("default", cookies_path if has_cookies else None, None),
-        ("tv_mweb_safari", cookies_path if has_cookies else None, ["tv", "mweb", "web_safari"]),
-    ]
+
+    # Ordered list of strategies: zero-cookie WARP first, then cookies, then 100% zero-cookie Invidious
+    strategies: list[tuple[str, Optional[Path], Optional[list[str]], Optional[str]]] = []
+    if warp_proxy:
+        strategies.append(("warp_nocookie", None, None, warp_proxy))
+        strategies.append(("warp_tv_mweb", None, ["tv", "mweb", "android_vr"], warp_proxy))
     if has_cookies:
-        # Fallback without cookies in case YouTube soft-flagged/rotated the cookie session
-        strategies.append(("nocookie_mweb_tv", None, ["mweb", "tv", "android_vr"]))
+        strategies.append(("cookies_default", cookies_path, None, warp_proxy))
+    strategies.append(("direct_nocookie", None, ["tv", "mweb", "android_vr"], None))
+    strategies.append(("invidious", None, None, None))
+
+    # Promote whatever strategy already worked in this session to avoid wasted retries!
+    if _PREFERRED_STRATEGY:
+        preferred = [s for s in strategies if s[0] == _PREFERRED_STRATEGY]
+        others = [s for s in strategies if s[0] != _PREFERRED_STRATEGY]
+        strategies = preferred + others
 
     info: Optional[dict[str, Any]] = None
     last_exc: Optional[Exception] = None
 
-    for strat_name, strat_cookies, player_clients in strategies:
+    for strat_name, strat_cookies, player_clients, proxy_url in strategies:
+        if strat_name == "invidious":
+            try:
+                media_path, inv_info = download_via_invidious_sync(
+                    url, quality, work_dir, on_progress
+                )
+                _PREFERRED_STRATEGY = "invidious"
+                print(f"[info] downloaded via zero-cookie strategy 'invidious': {url}")
+                return media_path, inv_info
+            except Exception as exc:
+                last_exc = exc
+                print(f"[warn] strategy 'invidious' failed ({exc})", file=sys.stderr)
+                continue
+
         opts = build_base_ydl_opts(strat_cookies)
         opts.update(
             {
@@ -361,6 +772,10 @@ def download_single_sync(
                 "overwrites": True,
             }
         )
+        if proxy_url:
+            opts["proxy"] = proxy_url
+            # Let proxy handle outgoing routing cleanly without forcing local bind
+            opts.pop("source_address", None)
         if player_clients:
             opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
         if on_progress:
@@ -390,18 +805,16 @@ def download_single_sync(
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
             if info:
-                if strat_name != "default":
-                    print(f"[info] downloaded via fallback strategy '{strat_name}': {url}")
+                _PREFERRED_STRATEGY = strat_name
+                print(f"[info] downloaded via strategy '{strat_name}': {url}")
                 break
         except Exception as exc:
             last_exc = exc
-            if is_bot_block_error(exc) and strat_name != strategies[-1][0]:
-                print(
-                    f"[warn] strategy '{strat_name}' hit YouTube restriction ({short_error(exc)}); trying next fallback...",
-                    file=sys.stderr,
-                )
-                continue
-            raise
+            print(
+                f"[warn] strategy '{strat_name}' failed ({short_error(exc)}); trying next fallback...",
+                file=sys.stderr,
+            )
+            continue
 
     if not info:
         if last_exc:
